@@ -1,0 +1,30 @@
+name = "bitrise"
+description = "The latest builds of the Bitrise apps you watch"
+protocol = 1
+command = ["python3", "plugin.py"]
+
+[[widget]]
+type = "bitrise"
+title = "Bitrise"
+description = "The latest builds of the Bitrise apps you watch: running first, then on hold, then finished."
+refresh = "2m"
+floor = "15s"
+
+[[widget.setting]]
+name = "token"
+kind = "secret"
+description = "Your Bitrise personal access token"
+why = "BITRISE_TOKEN in the environment takes its place when set."
+target = "https://app.bitrise.io/me/account/security"
+
+[[widget.setting]]
+name = "apps"
+kind = "string"
+default = ""
+description = "The Bitrise app slugs to watch, comma-separated"
+
+[[widget.setting]]
+name = "limit"
+kind = "int"
+default = 10
+description = "The most builds listed"

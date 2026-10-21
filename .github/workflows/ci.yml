@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  VISOR_REF: spec-64-plugins
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache: false
+      - name: Install visor
+        run: go install "github.com/oronbz/visor/cmd/visor@${VISOR_REF}"
+      - name: Test and check each Plugin
+        run: |
+          unset BITRISE_TOKEN
+          for manifest in */visor-plugin.toml; do
+            dir="$(dirname "$manifest")"
+            echo "::group::$dir"
+            python3 -m unittest discover -s "$dir" -v
+            visor plugin check "$dir"
+            echo "::endgroup::"
+          done
