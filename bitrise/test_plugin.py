@@ -258,6 +258,12 @@ class BitriseTest(unittest.TestCase):
     def refresh(self, plugin, widget="b1"):
         return plugin.request("widget/refresh", {"widget": widget})["result"]
 
+    def wait_for(self, condition):
+        deadline = time.monotonic() + WAIT
+        while not condition():
+            self.assertLess(time.monotonic(), deadline, "timed out waiting")
+            time.sleep(0.02)
+
     def test_without_a_token_it_asks_for_one(self):
         plugin = self.start()
         self.open(plugin, apps="app1")
@@ -577,6 +583,48 @@ class BitriseTest(unittest.TestCase):
         asked = len(self.bitrise.requests)
         self.assertIsNone(plugin.no_update(within=1.6))
         self.assertEqual(len(self.bitrise.requests), asked)
+
+    def test_a_fetch_in_flight_when_the_widget_closes_brings_none_of_its_builds_back(self):
+        self.env["BITRISE_FAST_POLL"] = "0.3"
+        self.bitrise.app("app1", "Rider iOS", [build("held", status=0, on_hold=True)])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        held = threading.Event()
+        self.addCleanup(held.set)
+        self.bitrise.gate = held
+        asked = len(self.bitrise.requests)
+        self.wait_for(lambda: len(self.bitrise.requests) > asked)
+        plugin.notify("widget/close", {"widget": "b1"})
+        held.set()
+        self.assertIsNone(plugin.no_update(within=0.6))
+        answer = self.invoke(plugin, "abort", "held")
+        self.assertIn("held", answer["error"]["message"])
+        self.assertEqual(self.bitrise.posts(), [])
+
+    def test_a_fetch_that_trips_the_plugin_is_an_error_and_fetching_goes_on(self):
+        self.env["BITRISE_FAST_POLL"] = "0.3"
+        self.bitrise.app("app1", "Rider iOS", [build("held", status=0, on_hold=True)])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        self.bitrise.app("app1", "Rider iOS", [{"status": 0, "is_on_hold": True}])
+        pushed = plugin.update(timeout=2)
+        self.assertNotIn("payload", pushed)
+        self.assertEqual(pushed["status"]["state"], "error")
+        self.bitrise.app("app1", "Rider iOS", [build("held", status=1, finished=ago(seconds=1))])
+        while "status" in pushed:
+            pushed = plugin.update(timeout=2)
+        self.assertEqual([i["id"] for i in pushed["payload"]["items"]], ["held"])
+        self.assertEqual(plugin.stderr, [])
+
+    def test_a_limit_that_is_not_a_number_is_an_error_naming_it(self):
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1", limit="lots")
+        status = self.refresh(plugin)["status"]
+        self.assertEqual(status["state"], "error")
+        self.assertIn("limit", status["message"])
+        self.assertEqual(self.bitrise.requests, [])
 
     def test_a_build_on_hold_is_fetched_again_until_it_finishes(self):
         self.env["BITRISE_FAST_POLL"] = "0.3"

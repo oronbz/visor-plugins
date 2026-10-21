@@ -44,9 +44,7 @@ GARBLED = "The Bitrise token has characters no token has; set a new one"
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-widgets = {}
 resolved = {}
-shown = {}
 lives = {}
 live_lock = threading.Lock()
 write_lock = threading.Lock()
@@ -219,7 +217,9 @@ def resolve(token, apps):
         missing = [a for a in apps if a.lower() not in lookup]
         if missing:
             raise UnknownApp(missing[0])
-        resolved[key] = list(dict.fromkeys(lookup[a.lower()] for a in apps))
+        slugs = list(dict.fromkeys(lookup[a.lower()] for a in apps))
+        with live_lock:
+            resolved[key] = slugs
     return resolved[key]
 
 
@@ -246,8 +246,14 @@ def apps_for_action(token):
         raise RPCError(-32000, "Couldn't reach Bitrise: %s" % getattr(e, "reason", e)) from None
 
 
+def settings_of(widget):
+    with live_lock:
+        live = lives.get(widget)
+        return live.settings if live else {}
+
+
 def watch_choices(widget):
-    settings = widgets.get(widget, {})
+    settings = settings_of(widget)
     apps = apps_for_action(token_of(settings))
     taken = {a.lower() for a in watched(settings)}
     choices = [{"id": a["slug"], "label": a.get("title") or a["slug"]} for a in apps
@@ -256,7 +262,7 @@ def watch_choices(widget):
 
 
 def watch(widget, slug):
-    settings = widgets.get(widget, {})
+    settings = settings_of(widget)
     titles = {a["slug"]: a.get("title") or a["slug"] for a in apps_for_action(token_of(settings))}
     if slug not in titles:
         raise RPCError(-32602, "Bitrise has no app `%s` this token can see" % slug)
@@ -297,37 +303,51 @@ def setup(message, action=None):
     return {"status": status}
 
 
+def limit_of(settings):
+    try:
+        return max(1, int(settings.get("limit", 10)))
+    except (TypeError, ValueError):
+        raise Problem(failure("`limit` must be a whole number, not `%s`" % settings.get("limit"),
+                              "bad limit")) from None
+
+
+class Problem(Exception):
+    def __init__(self, answer):
+        super().__init__(answer["status"]["state"])
+        self.answer = answer
+
+
 def load(widget):
-    """The Widget's (titles, builds) from Bitrise, or a status-only answer."""
-    settings = widgets.get(widget, {})
+    """The Widget's (titles, builds) from Bitrise; raises Problem with a status-only answer."""
+    settings = widget.settings
     token = token_of(settings)
     if not token:
-        return setup("Set a Bitrise personal access token", "secret:token")
+        raise Problem(setup("Set a Bitrise personal access token", "secret:token"))
     if garbled(token):
-        return setup(GARBLED, "secret:token")
+        raise Problem(setup(GARBLED, "secret:token"))
     apps = watched(settings)
     if not apps:
-        return setup("Pick the Bitrise apps to watch", WATCH)
-    limit = max(1, int(settings.get("limit", 10)))
+        raise Problem(setup("Pick the Bitrise apps to watch", WATCH))
+    limit = limit_of(settings)
     try:
         apps = resolve(token, apps)
         with ThreadPoolExecutor(max_workers=len(apps)) as pool:
             fetched = list(pool.map(lambda slug: fetch(token, slug, limit), apps))
     except UnknownApp as e:
-        return failure("Bitrise has no app `%s` this token can see" % e.slug, "unknown app",
-                       "Check the slugs and titles in this Widget's apps setting")
+        raise Problem(failure("Bitrise has no app `%s` this token can see" % e.slug, "unknown app",
+                              "Check the slugs and titles in this Widget's apps setting")) from None
     except BitriseError as e:
         if e.code in (401, 403):
-            return setup("Bitrise rejected the token (%d); set a new one" % e.code, "secret:token")
+            raise Problem(setup("Bitrise rejected the token (%d); set a new one" % e.code,
+                                "secret:token")) from None
         if e.code == 429:
-            return rate_limited(back_off_until(e.retry_after))
-        return failure(str(e), "Bitrise %d" % e.code)
-    except (URLError, OSError, ValueError) as e:
-        return failure("Couldn't reach Bitrise: %s" % getattr(e, "reason", e), "offline")
+            raise Problem(rate_limited(back_off_until(e.retry_after))) from None
+        raise Problem(failure(str(e), "Bitrise %d" % e.code)) from None
+    except (URLError, OSError) as e:
+        raise Problem(failure("Couldn't reach Bitrise: %s" % getattr(e, "reason", e), "offline")) from None
     titles = [title for title, _ in fetched]
     lists = [builds for _, builds in fetched]
     builds = sorted((b for bs in lists for b in bs), key=order)[:limit]
-    shown[widget] = {b["slug"]: b for b in builds}
     return titles, builds
 
 
@@ -343,12 +363,14 @@ def payload(titles, builds):
 
 
 class Live:
-    """A Widget's last builds and the timers that keep them fresh while it's visible."""
+    """A Widget's settings, last builds and the timers that keep them fresh while it's visible."""
 
-    def __init__(self, widget, visible):
+    def __init__(self, widget, settings, visible):
         self.widget = widget
+        self.settings = settings
         self.visible = visible
         self.closed = threading.Event()
+        self.sending = threading.Lock()
         self.titles = []
         self.builds = []
         self.failed = False
@@ -356,18 +378,17 @@ class Live:
         self.poller = None
         self.limit = None
 
-    def take(self, loaded):
-        if isinstance(loaded, dict):
+    def take(self, loaded, update):
+        if loaded is None:
             self.failed = True
-            state = loaded["status"]["state"]
+            state = update["status"]["state"]
             if state == "setup":
                 self.builds = []
             if state == "rate_limited":
-                self.limit = loaded
-            return loaded
+                self.limit = update
+            return
         self.failed = False
         self.titles, self.builds = loaded
-        return {"payload": payload(self.titles, self.builds)}
 
     def ticking(self):
         return (self.visible and not self.failed and not self.closed.is_set()
@@ -402,42 +423,65 @@ class Live:
                     return
                 if self.limited():
                     continue
-            loaded = load(self.widget)
-            with live_lock:
-                if self.closed.is_set():
-                    return
-                update = self.take(loaded)
-                if self.visible:
-                    self.push(update)
-                self.keep()
+            update = refreshed(self)
+            self.push(lambda: update if self.visible else None)
 
     def tick(self):
         while not self.closed.wait(TICK):
-            with live_lock:
-                if not self.ticking():
-                    self.ticker = None
-                    return
-                self.push({"payload": payload(self.titles, self.builds)})
+            if self.push(self.ticked) is None:
+                return
 
-    def push(self, update):
-        update["widget"] = self.widget
-        send({"method": "widget/update", "params": update})
+    def ticked(self):
+        if not self.ticking():
+            self.ticker = None
+            return None
+        return {"payload": payload(self.titles, self.builds)}
+
+    def push(self, make):
+        """Sends make()'s update, made under live_lock, unless the Widget has closed."""
+        with self.sending:
+            with live_lock:
+                update = None if self.closed.is_set() else make()
+            if update is not None:
+                update["widget"] = self.widget
+                send({"method": "widget/update", "params": update})
+            return update
+
+
+def refreshed(live):
+    """Fetches live's builds and answers its update, keeping them only while it's open."""
+    loaded = None
+    try:
+        loaded = load(live)
+        update = {"payload": payload(*loaded)}
+    except Problem as p:
+        loaded, update = None, p.answer
+    except Exception as e:
+        loaded, update = None, failure("the Plugin failed: %s" % type(e).__name__, "plugin failed")
+    with live_lock:
+        if not live.closed.is_set():
+            live.take(loaded, update)
+            live.keep()
+    return update
 
 
 def refresh(widget):
     with live_lock:
         live = lives.get(widget)
-        limit = live and live.limited()
+        if live is None:
+            raise RPCError(-32602, "no Widget `%s`" % widget)
+        limit = live.limited()
     if limit:
         return limit
-    loaded = load(widget)
+    return dict(refreshed(live))
+
+
+def shown_build(widget, slug):
     with live_lock:
         live = lives.get(widget)
-        if live is None:
-            return Live(widget, False).take(loaded)
-        update = live.take(loaded)
-        live.keep()
-        return update
+        builds = live.builds if live else []
+        b = next((b for b in builds if b["slug"] == slug), None)
+        return b, live.settings if live else {}
 
 
 def abort(token, b):
@@ -471,10 +515,10 @@ def invoke(params):
     action = params.get("action")
     if action not in INVOKES:
         raise RPCError(-32602, "no Action `%s`" % action)
-    b = shown.get(params["widget"], {}).get(params.get("item"))
+    b, settings = shown_build(params["widget"], params.get("item"))
     if b is None:
         raise RPCError(-32602, "no build `%s` on this Widget" % params.get("item"))
-    token = token_of(widgets.get(params["widget"], {}))
+    token = token_of(settings)
     if garbled(token):
         raise RPCError(-32000, GARBLED)
     try:
@@ -489,15 +533,13 @@ def handle(method, params):
     if method == "initialize":
         return {"protocol": 1}
     if method == "widget/open":
-        widgets[params["widget"]] = params.get("settings") or {}
         with live_lock:
             old = lives.get(params["widget"])
             if old:
                 old.closed.set()
-            lives[params["widget"]] = Live(params["widget"], params.get("visible", True))
+            lives[params["widget"]] = Live(params["widget"], params.get("settings") or {},
+                                           params.get("visible", True))
     elif method == "widget/close":
-        widgets.pop(params["widget"], None)
-        shown.pop(params["widget"], None)
         with live_lock:
             live = lives.pop(params["widget"], None)
             if live:
