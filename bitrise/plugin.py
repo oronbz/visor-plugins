@@ -15,6 +15,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 API_URL = os.environ.get("BITRISE_API_URL", "https://api.bitrise.io/v0.1").rstrip("/")
+BUILD_URL = "https://app.bitrise.io/build/"
 TIMEOUT = 15
 
 RUNNING, ON_HOLD, SUCCEEDED, FAILED, ABORTED = "running", "on hold", "succeeded", "failed", "aborted"
@@ -39,6 +40,7 @@ EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 widgets = {}
 resolved = {}
+shown = {}
 write_lock = threading.Lock()
 
 
@@ -74,6 +76,16 @@ def get(token, path, query=None):
     if query:
         url += "?" + urlencode(query)
     req = Request(url, headers={"Authorization": token, "Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=TIMEOUT) as resp:
+            return json.load(resp)
+    except HTTPError as e:
+        raise BitriseError(e.code, path) from None
+
+
+def post(token, path, body):
+    req = Request(API_URL + path, data=json.dumps(body).encode(), method="POST", headers={
+        "Authorization": token, "Accept": "application/json", "Content-Type": "application/json"})
     try:
         with urlopen(req, timeout=TIMEOUT) as resp:
             return json.load(resp)
@@ -128,6 +140,19 @@ def order(b):
     return rank, -(parse_time(when) or EPOCH).timestamp()
 
 
+def actions(b):
+    url = BUILD_URL + b["slug"]
+    out = [{"id": "open", "label": "Open build", "primary": True, "verb": "open", "target": url}]
+    if b.get("pull_request_view_url"):
+        out.append({"id": "pr", "key": "p", "label": "Open pull request", "verb": "open",
+                    "target": b["pull_request_view_url"]})
+    out.append({"id": "copy", "key": "y", "label": "Copy build URL", "verb": "copy", "target": url})
+    if b["state"] in (RUNNING, ON_HOLD):
+        out.append({"id": "abort", "key": "x", "label": "Abort build", "confirm": True})
+    out.append({"id": "rebuild", "key": "R", "label": "Rebuild", "confirm": True})
+    return out
+
+
 def item(b, now):
     glyph, token = GLYPHS[b["state"]]
     pr = b.get("pull_request_id")
@@ -140,6 +165,7 @@ def item(b, now):
             [{"text": "#%d" % pr if pr else b.get("branch") or "", "token": "fg"}],
             [{"text": elapsed(b, now), "token": "faint"}],
         ],
+        "actions": actions(b),
     }
 
 
@@ -154,6 +180,7 @@ def fetch(token, slug, limit):
     builds = get(token, path + "/builds", {"sort_by": "running_first", "limit": limit})["data"]
     for b in builds:
         b["app"] = title
+        b["app_slug"] = slug
         b["state"] = state_of(b)
     return title, builds
 
@@ -260,6 +287,7 @@ def refresh(widget):
     titles = [title for title, _ in fetched]
     lists = [builds for _, builds in fetched]
     builds = sorted((b for bs in lists for b in bs), key=order)[:limit]
+    shown[widget] = {b["slug"]: b for b in builds}
     now = datetime.now(timezone.utc)
     return {"payload": {
         "columns": COLUMNS,
@@ -270,6 +298,49 @@ def refresh(widget):
     }}
 
 
+def abort(token, b):
+    post(token, "/apps/%s/builds/%s/abort" % (quote(b["app_slug"], safe=""), quote(b["slug"], safe="")), {
+        "abort_reason": "Aborted from visor",
+        "abort_with_success": False,
+        "skip_git_status_report": False,
+        "skip_notifications": False,
+    })
+    return {"toast": "Aborted %s on %s" % (b.get("triggered_workflow"), b["app"])}
+
+
+def rebuild(token, b):
+    params = b.get("original_build_params")
+    if not params:
+        params = {"branch": b.get("branch"), "workflow_id": b.get("triggered_workflow"),
+                  "commit_hash": b.get("commit_hash")}
+        if b.get("pull_request_id"):
+            params["pull_request_id"] = b["pull_request_id"]
+            params["branch_dest"] = b.get("pull_request_target_branch")
+        params = {k: v for k, v in params.items() if v}
+    post(token, "/apps/%s/builds" % quote(b["app_slug"], safe=""),
+         {"hook_info": {"type": "bitrise"}, "build_params": params})
+    return {"toast": "Rebuilding %s on %s" % (b.get("triggered_workflow"), b["app"])}
+
+
+INVOKES = {"abort": abort, "rebuild": rebuild}
+
+
+def invoke(params):
+    action = params.get("action")
+    if action not in INVOKES:
+        raise RPCError(-32602, "no Action `%s`" % action)
+    b = shown.get(params["widget"], {}).get(params.get("item"))
+    if b is None:
+        raise RPCError(-32602, "no build `%s` on this Widget" % params.get("item"))
+    token = token_of(widgets.get(params["widget"], {}))
+    try:
+        return INVOKES[action](token, b)
+    except BitriseError as e:
+        raise RPCError(-32000, str(e)) from None
+    except (URLError, OSError, ValueError) as e:
+        raise RPCError(-32000, "Couldn't reach Bitrise: %s" % getattr(e, "reason", e)) from None
+
+
 def handle(method, params):
     if method == "initialize":
         return {"protocol": 1}
@@ -277,6 +348,7 @@ def handle(method, params):
         widgets[params["widget"]] = params.get("settings") or {}
     elif method == "widget/close":
         widgets.pop(params["widget"], None)
+        shown.pop(params["widget"], None)
     elif method == "widget/frame":
         pass
     elif method == "widget/refresh":
@@ -285,7 +357,9 @@ def handle(method, params):
         return watch_choices(params["widget"])
     elif method == "action/invoke" and params.get("action") == WATCH["id"]:
         return watch(params["widget"], params.get("choice") or "")
-    elif method in ("action/invoke", "action/choices"):
+    elif method == "action/invoke":
+        return invoke(params)
+    elif method == "action/choices":
         raise RPCError(-32602, "no Action `%s`" % params.get("action"))
     else:
         raise RPCError(-32601, "no method `%s`" % method)
