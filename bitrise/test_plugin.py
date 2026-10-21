@@ -56,37 +56,27 @@ class FakeBitrise:
 
             def do_GET(self):
                 url = urlsplit(self.path)
-                fake.requests.append({
-                    "method": "GET",
-                    "path": url.path,
-                    "query": {k: v[0] for k, v in parse_qs(url.query).items()},
-                    "authorization": self.headers.get("Authorization"),
-                })
-                code, body = fake.answer(url.path, self.headers.get("Authorization"),
-                                         fake.requests[-1]["query"])
+                query = {k: v[0] for k, v in parse_qs(url.query).items()}
+                self.record("GET", path=url.path, query=query)
+                self.reply(*fake.answer_get(url.path, self.headers.get("Authorization"), query))
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"null")
+                self.record("POST", path=self.path, body=body)
+                self.reply(*fake.answer_post(self.path, self.headers.get("Authorization")))
+
+            def record(self, method, **request):
+                fake.requests.append(dict(request, method=method,
+                                          authorization=self.headers.get("Authorization")))
+
+            def reply(self, code, body):
                 data = json.dumps(body).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 if code == 429 and fake.retry_after:
                     self.send_header("Retry-After", fake.retry_after)
-                self.end_headers()
-                self.wfile.write(data)
-
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(length) or b"null")
-                fake.requests.append({
-                    "method": "POST",
-                    "path": self.path,
-                    "body": body,
-                    "authorization": self.headers.get("Authorization"),
-                })
-                code, answer = fake.answer_post(self.path, self.headers.get("Authorization"))
-                data = json.dumps(answer).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
 
@@ -101,7 +91,7 @@ class FakeBitrise:
     def app(self, slug, title, builds=()):
         self.apps[slug] = {"title": title, "builds": list(builds)}
 
-    def answer(self, path, auth, query):
+    def answer_get(self, path, auth, query):
         if path in self.fail:
             return self.fail[path], {"message": "nope"}
         if auth != TOKEN:
@@ -129,7 +119,8 @@ class FakeBitrise:
         paging = {"total_item_count": len(slugs), "page_item_limit": self.page}
         if start + self.page < len(slugs):
             paging["next"] = slugs[start + self.page]
-        return {"data": [{"slug": s, "title": self.apps[s]["title"]} for s in page], "paging": paging}
+        data = [{"slug": s, "title": self.apps[s]["title"]} for s in page]
+        return {"data": data, "paging": paging}
 
     def answer_post(self, path, auth):
         if path in self.fail:
@@ -137,7 +128,8 @@ class FakeBitrise:
         if auth != TOKEN:
             return 401, {"message": "Unauthorized"}
         parts = path.split("/")
-        if len(parts) < 5 or parts[2] != "apps" or parts[3] not in self.apps or parts[4] != "builds":
+        if (len(parts) < 5 or parts[2] != "apps" or parts[3] not in self.apps
+                or parts[4] != "builds"):
             return 404, {"message": "Not Found"}
         if len(parts) == 7 and parts[6] == "abort":
             return 200, {"status": "ok"}
@@ -201,9 +193,10 @@ class Plugin:
     def update(self, timeout=WAIT):
         return self.updates.get(timeout=timeout)
 
-    def no_update(self, within):
+    def update_within(self, seconds):
+        """The next update pushed within seconds, or None."""
         try:
-            return self.updates.get(timeout=within)
+            return self.updates.get(timeout=seconds)
         except queue.Empty:
             return None
 
@@ -262,6 +255,42 @@ class BitriseTest(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, "timed out waiting")
             time.sleep(0.02)
 
+    def items(self, result):
+        self.assertNotIn("status", result)
+        return result["payload"]["items"]
+
+    def texts(self, item):
+        return ["".join(s.get("text", "") for s in field) for field in item["fields"]]
+
+    def frame(self, plugin, visible, widget="b1"):
+        plugin.notify("widget/frame", {
+            "widget": widget, "size": {"width": 60, "height": 10}, "focused": False,
+            "visible": visible})
+
+    def choices(self, plugin, widget="b1"):
+        answer = plugin.request("action/choices", {"widget": widget, "action": "watch"})
+        self.assertNotIn("error", answer)
+        return answer["result"]["choices"]
+
+    def actions(self, item):
+        return {a["id"]: a for a in item.get("actions", [])}
+
+    def invoke(self, plugin, action, item, widget="b1"):
+        return plugin.request("action/invoke", {"widget": widget, "action": action, "item": item})
+
+    def rebuild_body(self, b):
+        self.bitrise.app("app1", "Rider iOS", [b])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        result = self.invoke(plugin, "rebuild", b["slug"])["result"]
+        self.assertEqual(result, {"toast": "Rebuilding test_pr on Rider iOS"})
+        [request] = self.bitrise.posts()
+        self.assertEqual(request["path"], "/v0.1/apps/app1/builds")
+        self.assertEqual(request["authorization"], TOKEN)
+        self.assertEqual(request["body"]["hook_info"], {"type": "bitrise"})
+        return request["body"]["build_params"]
+
     def test_without_a_token_it_asks_for_one(self):
         plugin = self.start()
         self.open(plugin, apps="app1")
@@ -270,16 +299,10 @@ class BitriseTest(unittest.TestCase):
         self.assertEqual(status["action"], "secret:token")
         self.assertEqual(self.bitrise.requests, [])
 
-    def items(self, result):
-        self.assertNotIn("status", result)
-        return result["payload"]["items"]
-
-    def texts(self, item):
-        return ["".join(s.get("text", "") for s in field) for field in item["fields"]]
-
     def test_a_finished_build_shows_its_status_app_workflow_branch_and_age(self):
         self.bitrise.app("app1", "Rider iOS", [
-            build("b-1", status=2, workflow="test_pr", branch="feature/x", finished=ago(minutes=5, seconds=10)),
+            build("b-1", status=2, workflow="test_pr", branch="feature/x",
+                  finished=ago(minutes=5, seconds=10)),
         ])
         plugin = self.start()
         self.open(plugin, token=TOKEN, apps="app1")
@@ -316,7 +339,10 @@ class BitriseTest(unittest.TestCase):
 
     def test_the_count_is_every_running_build_even_those_past_the_limit(self):
         self.bitrise.app("app1", "Rider iOS", [build("r-%d" % n, status=0) for n in range(3)])
-        self.bitrise.app("app2", "Driver Android", [build("r-9", status=0), build("h-1", status=0, on_hold=True)])
+        self.bitrise.app("app2", "Driver Android", [
+            build("r-9", status=0),
+            build("h-1", status=0, on_hold=True),
+        ])
         plugin = self.start()
         self.open(plugin, token=TOKEN, apps="app1, app2", limit=2)
         result = self.refresh(plugin)
@@ -367,7 +393,8 @@ class BitriseTest(unittest.TestCase):
 
     def test_a_running_build_shows_how_long_it_has_run(self):
         self.bitrise.app("app1", "Rider iOS", [
-            build("started", status=0, triggered=ago(minutes=20), started=ago(minutes=12, seconds=30)),
+            build("started", status=0, triggered=ago(minutes=20),
+                  started=ago(minutes=12, seconds=30)),
             build("queued", status=0, triggered=ago(minutes=2, seconds=5)),
             build("long", status=0, started=ago(hours=1, minutes=4, seconds=30)),
         ])
@@ -432,7 +459,8 @@ class BitriseTest(unittest.TestCase):
         self.open(plugin, token=TOKEN, apps=" , ")
         status = self.refresh(plugin)["status"]
         self.assertEqual(status["state"], "setup")
-        self.assertEqual(status["action"], {"id": "watch", "label": "Watch app…", "input": "choice"})
+        self.assertEqual(status["action"],
+                         {"id": "watch", "label": "Watch app…", "input": "choice"})
         self.assertEqual(self.bitrise.requests, [])
 
     def test_the_list_offers_watch_app(self):
@@ -488,8 +516,8 @@ class BitriseTest(unittest.TestCase):
                 self.assertNotIn("payload", result)
                 self.assertEqual(result["status"]["state"], "rate_limited")
                 until = datetime.strptime(result["status"]["until"], "%Y-%m-%dT%H:%M:%SZ")
-                left = (until.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds()
-                self.assertAlmostEqual(left, wait, delta=3)
+                left = until.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)
+                self.assertAlmostEqual(left.total_seconds(), wait, delta=3)
 
     def test_a_rate_limited_widget_asks_bitrise_nothing_until_then(self):
         self.env["BITRISE_FAST_POLL"] = "0.3"
@@ -503,7 +531,7 @@ class BitriseTest(unittest.TestCase):
         self.assertNotIn("payload", pushed)
         self.assertEqual(pushed["status"]["state"], "rate_limited")
         asked = len(self.bitrise.requests)
-        self.assertIsNone(plugin.no_update(within=1))
+        self.assertIsNone(plugin.update_within(1))
         self.assertEqual(self.refresh(plugin)["status"], pushed["status"])
         self.assertEqual(len(self.bitrise.requests), asked)
 
@@ -564,17 +592,13 @@ class BitriseTest(unittest.TestCase):
         self.assertGreater(int(now["run"][4].rstrip("s")), int(first["run"][4].rstrip("s")))
         self.assertEqual(len(self.bitrise.requests), asked)
 
-    def frame(self, plugin, visible, widget="b1"):
-        plugin.notify("widget/frame", {
-            "widget": widget, "size": {"width": 60, "height": 10}, "focused": False, "visible": visible})
-
     def test_a_hidden_widget_stops_ticking_until_shown_again(self):
         self.bitrise.app("app1", "Rider iOS", [build("run", status=0, started=ago(seconds=5))])
         plugin = self.start()
         self.open(plugin, token=TOKEN, apps="app1")
         self.refresh(plugin)
         self.frame(plugin, visible=False)
-        self.assertIsNone(plugin.no_update(within=1.6))
+        self.assertIsNone(plugin.update_within(1.6))
         self.frame(plugin, visible=True)
         self.assertEqual(plugin.update(timeout=2.5)["widget"], "b1")
 
@@ -583,7 +607,7 @@ class BitriseTest(unittest.TestCase):
         plugin = self.start()
         self.open(plugin, token=TOKEN, apps="app1", visible=False)
         self.refresh(plugin)
-        self.assertIsNone(plugin.no_update(within=1.6))
+        self.assertIsNone(plugin.update_within(1.6))
 
     def test_a_closed_widget_stops_ticking(self):
         self.bitrise.app("app1", "Rider iOS", [build("run", status=0, started=ago(seconds=5))])
@@ -592,7 +616,7 @@ class BitriseTest(unittest.TestCase):
         self.open(plugin, widget="b2", token=TOKEN, apps="app1", visible=False)
         self.refresh(plugin)
         plugin.notify("widget/close", {"widget": "b1"})
-        self.assertIsNone(plugin.no_update(within=1.6))
+        self.assertIsNone(plugin.update_within(1.6))
 
     def test_finished_builds_neither_tick_nor_poll(self):
         self.env["BITRISE_FAST_POLL"] = "0.3"
@@ -601,7 +625,7 @@ class BitriseTest(unittest.TestCase):
         self.open(plugin, token=TOKEN, apps="app1")
         self.refresh(plugin)
         asked = len(self.bitrise.requests)
-        self.assertIsNone(plugin.no_update(within=1.6))
+        self.assertIsNone(plugin.update_within(1.6))
         self.assertEqual(len(self.bitrise.requests), asked)
 
     def test_a_fetch_in_flight_when_the_widget_closes_brings_none_of_its_builds_back(self):
@@ -617,7 +641,7 @@ class BitriseTest(unittest.TestCase):
         self.wait_for(lambda: len(self.bitrise.requests) > asked)
         plugin.notify("widget/close", {"widget": "b1"})
         held.set()
-        self.assertIsNone(plugin.no_update(within=0.6))
+        self.assertIsNone(plugin.update_within(0.6))
         answer = self.invoke(plugin, "abort", "held")
         self.assertIn("held", answer["error"]["message"])
         self.assertEqual(self.bitrise.posts(), [])
@@ -658,12 +682,13 @@ class BitriseTest(unittest.TestCase):
         [item] = pushed["payload"]["items"]
         self.assertEqual(self.texts(item)[0], "✓")
         asked = len(self.bitrise.requests)
-        self.assertIsNone(plugin.no_update(within=1))
+        self.assertIsNone(plugin.update_within(1))
         self.assertEqual(len(self.bitrise.requests), asked)
 
     def test_two_widgets_keep_their_own_builds_and_timers(self):
         self.bitrise.app("app1", "Rider iOS", [build("r-1", status=0, started=ago(seconds=5))])
-        self.bitrise.app("app2", "Driver Android", [build("r-2", status=0, started=ago(seconds=5))])
+        self.bitrise.app("app2", "Driver Android",
+                         [build("r-2", status=0, started=ago(seconds=5))])
         plugin = self.start()
         self.open(plugin, widget="b1", token=TOKEN, apps="app1")
         self.open(plugin, widget="b2", token=TOKEN, apps="app2")
@@ -676,11 +701,6 @@ class BitriseTest(unittest.TestCase):
         for update in pushed:
             self.assertEqual(update["widget"], "b2")
             self.assertEqual([i["id"] for i in update["payload"]["items"]], ["r-2"])
-
-    def choices(self, plugin, widget="b1"):
-        answer = plugin.request("action/choices", {"widget": widget, "action": "watch"})
-        self.assertNotIn("error", answer)
-        return answer["result"]["choices"]
 
     def test_watch_app_offers_the_apps_the_token_sees_but_not_the_watched_ones(self):
         self.bitrise.app("app1", "Rider iOS")
@@ -716,12 +736,10 @@ class BitriseTest(unittest.TestCase):
             with self.subTest(apps=apps):
                 self.open(plugin, token=TOKEN, apps=apps)
                 [choice] = [c for c in self.choices(plugin) if c["id"] == "app2"]
-                answer = plugin.request("action/invoke", {"widget": "b1", "action": "watch", "choice": choice["id"]})
+                answer = plugin.request("action/invoke", {
+                    "widget": "b1", "action": "watch", "choice": choice["id"]})
                 self.assertEqual(answer["result"]["settings"], {"apps": written})
                 self.assertIn("Driver Android", answer["result"]["toast"])
-
-    def actions(self, item):
-        return {a["id"]: a for a in item.get("actions", [])}
 
     def test_a_finished_branch_build_opens_copies_and_rebuilds(self):
         self.bitrise.app("app1", "Rider iOS", [build("b-1", status=2)])
@@ -754,9 +772,6 @@ class BitriseTest(unittest.TestCase):
             "id": "abort", "key": "x", "label": "Abort build", "confirm": True})
         self.assertEqual(sorted(items["held"]), ["abort", "copy", "open", "rebuild"])
 
-    def invoke(self, plugin, action, item, widget="b1"):
-        return plugin.request("action/invoke", {"widget": widget, "action": action, "item": item})
-
     def test_abort_stops_the_build_and_says_so(self):
         self.bitrise.app("app1", "Rider iOS", [build("run", status=0, workflow="test_pr")])
         plugin = self.start()
@@ -771,19 +786,6 @@ class BitriseTest(unittest.TestCase):
             "authorization": TOKEN,
         }])
         self.assertEqual(result, {"toast": "Aborted test_pr on Rider iOS"})
-
-    def rebuild_body(self, b):
-        self.bitrise.app("app1", "Rider iOS", [b])
-        plugin = self.start()
-        self.open(plugin, token=TOKEN, apps="app1")
-        self.refresh(plugin)
-        result = self.invoke(plugin, "rebuild", b["slug"])["result"]
-        self.assertEqual(result, {"toast": "Rebuilding test_pr on Rider iOS"})
-        [request] = self.bitrise.posts()
-        self.assertEqual(request["path"], "/v0.1/apps/app1/builds")
-        self.assertEqual(request["authorization"], TOKEN)
-        self.assertEqual(request["body"]["hook_info"], {"type": "bitrise"})
-        return request["body"]["build_params"]
 
     def test_rebuild_resends_the_original_build_params(self):
         original = {

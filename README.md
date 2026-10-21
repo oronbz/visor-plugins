@@ -10,7 +10,7 @@ Plugins need `python3` (3.9 or later) on your `PATH`. Windows doesn't come with 
 
 ## bitrise
 
-The builds of every Bitrise app you watch, in one list: running builds first, then builds on hold, then the latest finished ones, newest first in each group. Each row has:
+The builds of every Bitrise app you watch, in one list: running builds first, then builds on hold, then the latest finished ones, newest first in each group. Each Item has:
 
 - a status glyph: ● running (accent), ◌ on hold (warn), ✓ succeeded (ok), ✗ failed (bad), ⊘ aborted (faint)
 - the app, dimmed
