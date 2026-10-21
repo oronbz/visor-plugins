@@ -4,6 +4,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +44,7 @@ class FakeBitrise:
     def __init__(self):
         self.apps = {}
         self.fail = {}
+        self.retry_after = None
         self.gate = None
         self.requests = []
         fake = self
@@ -64,12 +66,14 @@ class FakeBitrise:
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
+                if code == 429 and fake.retry_after:
+                    self.send_header("Retry-After", fake.retry_after)
                 self.end_headers()
                 self.wfile.write(data)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = "http://127.0.0.1:%d/v0.1" % self.server.server_address[1]
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, args=(0.05,), daemon=True).start()
 
     def close(self):
         self.server.shutdown()
@@ -112,6 +116,7 @@ class Plugin:
             text=True, bufsize=1)
         self.lines = []
         self.messages = queue.Queue()
+        self.updates = queue.Queue()
         self.next_id = 0
         threading.Thread(target=self._read, daemon=True).start()
         self.stderr = []
@@ -120,7 +125,11 @@ class Plugin:
     def _read(self):
         for line in self.proc.stdout:
             self.lines.append(line)
-            self.messages.put(json.loads(line))
+            msg = json.loads(line)
+            if msg.get("method") == "widget/update":
+                self.updates.put(msg["params"])
+            else:
+                self.messages.put(msg)
 
     def _read_stderr(self):
         for line in self.proc.stderr:
@@ -141,6 +150,27 @@ class Plugin:
             msg = self.messages.get(timeout=WAIT)
             if msg.get("id") == self.next_id:
                 return msg
+
+    def update(self, timeout=WAIT):
+        return self.updates.get(timeout=timeout)
+
+    def no_update(self, within):
+        try:
+            return self.updates.get(timeout=within)
+        except queue.Empty:
+            return None
+
+    def updates_for(self, seconds):
+        deadline = time.monotonic() + seconds
+        pushed = []
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return pushed
+            try:
+                pushed.append(self.updates.get(timeout=left))
+            except queue.Empty:
+                return pushed
 
     def close(self):
         self.proc.stdin.close()
@@ -169,12 +199,12 @@ class BitriseTest(unittest.TestCase):
         for line in plugin.lines + plugin.stderr:
             self.assertNotIn(TOKEN, line)
 
-    def open(self, plugin, widget="b1", **settings):
+    def open(self, plugin, widget="b1", visible=True, **settings):
         full = {"apps": "", "limit": 10}
         full.update(settings)
         plugin.notify("widget/open", {
             "widget": widget, "type": "bitrise", "settings": full,
-            "size": {"width": 60, "height": 10}, "focused": False, "visible": True})
+            "size": {"width": 60, "height": 10}, "focused": False, "visible": visible})
 
     def refresh(self, plugin, widget="b1"):
         return plugin.request("widget/refresh", {"widget": widget})["result"]
@@ -328,6 +358,53 @@ class BitriseTest(unittest.TestCase):
         self.assertEqual(result["status"]["state"], "error")
         self.assertIn("500", result["status"]["message"])
 
+    def test_a_rate_limit_waits_as_long_as_bitrise_asks_or_a_minute(self):
+        self.bitrise.app("app1", "Rider iOS", [build("b-1")])
+        self.bitrise.fail = {"/v0.1/apps/app1/builds": 429}
+        for retry_after, wait in (("120", 120), (None, 60)):
+            with self.subTest(retry_after=retry_after):
+                self.bitrise.retry_after = retry_after
+                plugin = self.start()
+                self.open(plugin, token=TOKEN, apps="app1")
+                result = self.refresh(plugin)
+                self.assertNotIn("payload", result)
+                self.assertEqual(result["status"]["state"], "rate_limited")
+                until = datetime.strptime(result["status"]["until"], "%Y-%m-%dT%H:%M:%SZ")
+                left = (until.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+                self.assertAlmostEqual(left, wait, delta=3)
+
+    def test_a_rate_limited_widget_asks_bitrise_nothing_until_then(self):
+        self.env["BITRISE_FAST_POLL"] = "0.3"
+        self.bitrise.app("app1", "Rider iOS", [build("held", status=0, on_hold=True)])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        self.bitrise.fail = {"/v0.1/apps/app1/builds": 429}
+        self.bitrise.retry_after = "60"
+        pushed = plugin.update(timeout=2)
+        self.assertNotIn("payload", pushed)
+        self.assertEqual(pushed["status"]["state"], "rate_limited")
+        asked = len(self.bitrise.requests)
+        self.assertIsNone(plugin.no_update(within=1))
+        self.assertEqual(self.refresh(plugin)["status"], pushed["status"])
+        self.assertEqual(len(self.bitrise.requests), asked)
+
+    def test_a_failed_fetch_while_running_pushes_an_error_and_stops_ticking(self):
+        self.env["BITRISE_FAST_POLL"] = "0.3"
+        self.bitrise.app("app1", "Rider iOS", [build("run", status=0, started=ago(seconds=5))])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        self.bitrise.fail = {"/v0.1/apps/app1/builds": 502}
+        while True:
+            pushed = plugin.update(timeout=2)
+            if "status" in pushed:
+                break
+        self.assertNotIn("payload", pushed)
+        self.assertEqual(pushed["status"]["state"], "error")
+        for pushed in plugin.updates_for(1.5):
+            self.assertNotIn("payload", pushed)
+
     def test_an_unreachable_bitrise_is_an_error(self):
         self.env["BITRISE_API_URL"] = "http://127.0.0.1:9/v0.1"
         plugin = self.start()
@@ -350,6 +427,95 @@ class BitriseTest(unittest.TestCase):
         self.open(plugin, apps="app1")
         self.open(plugin, token=TOKEN, apps="app1")
         self.assertEqual([i["id"] for i in self.items(self.refresh(plugin))], ["b-1"])
+
+    def test_a_running_build_ticks_every_second_without_asking_bitrise(self):
+        self.bitrise.app("app1", "Rider iOS", [
+            build("run", status=0, started=ago(seconds=5)),
+            build("done", status=1, finished=ago(minutes=5)),
+        ])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        first = {i["id"]: self.texts(i) for i in self.items(self.refresh(plugin))}
+        asked = len(self.bitrise.requests)
+        pushed = plugin.update(timeout=2.5)
+        self.assertEqual(pushed["widget"], "b1")
+        self.assertNotIn("status", pushed)
+        now = {i["id"]: self.texts(i) for i in pushed["payload"]["items"]}
+        self.assertEqual(now["done"], first["done"])
+        self.assertEqual(now["run"][:4], first["run"][:4])
+        self.assertGreater(int(now["run"][4].rstrip("s")), int(first["run"][4].rstrip("s")))
+        self.assertEqual(len(self.bitrise.requests), asked)
+
+    def frame(self, plugin, visible, widget="b1"):
+        plugin.notify("widget/frame", {
+            "widget": widget, "size": {"width": 60, "height": 10}, "focused": False, "visible": visible})
+
+    def test_a_hidden_widget_stops_ticking_until_shown_again(self):
+        self.bitrise.app("app1", "Rider iOS", [build("run", status=0, started=ago(seconds=5))])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        self.frame(plugin, visible=False)
+        self.assertIsNone(plugin.no_update(within=1.6))
+        self.frame(plugin, visible=True)
+        self.assertEqual(plugin.update(timeout=2.5)["widget"], "b1")
+
+    def test_a_widget_opened_hidden_does_not_tick(self):
+        self.bitrise.app("app1", "Rider iOS", [build("run", status=0, started=ago(seconds=5))])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1", visible=False)
+        self.refresh(plugin)
+        self.assertIsNone(plugin.no_update(within=1.6))
+
+    def test_a_closed_widget_stops_ticking(self):
+        self.bitrise.app("app1", "Rider iOS", [build("run", status=0, started=ago(seconds=5))])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.open(plugin, widget="b2", token=TOKEN, apps="app1", visible=False)
+        self.refresh(plugin)
+        plugin.notify("widget/close", {"widget": "b1"})
+        self.assertIsNone(plugin.no_update(within=1.6))
+
+    def test_finished_builds_neither_tick_nor_poll(self):
+        self.env["BITRISE_FAST_POLL"] = "0.3"
+        self.bitrise.app("app1", "Rider iOS", [build("done", status=1, finished=ago(minutes=5))])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        asked = len(self.bitrise.requests)
+        self.assertIsNone(plugin.no_update(within=1.6))
+        self.assertEqual(len(self.bitrise.requests), asked)
+
+    def test_a_build_on_hold_is_fetched_again_until_it_finishes(self):
+        self.env["BITRISE_FAST_POLL"] = "0.3"
+        self.bitrise.app("app1", "Rider iOS", [build("held", status=0, on_hold=True)])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        self.bitrise.app("app1", "Rider iOS", [build("held", status=1, finished=ago(seconds=1))])
+        pushed = plugin.update(timeout=2)
+        self.assertEqual(pushed["widget"], "b1")
+        [item] = pushed["payload"]["items"]
+        self.assertEqual(self.texts(item)[0], "✓")
+        asked = len(self.bitrise.requests)
+        self.assertIsNone(plugin.no_update(within=1))
+        self.assertEqual(len(self.bitrise.requests), asked)
+
+    def test_two_widgets_keep_their_own_builds_and_timers(self):
+        self.bitrise.app("app1", "Rider iOS", [build("r-1", status=0, started=ago(seconds=5))])
+        self.bitrise.app("app2", "Driver Android", [build("r-2", status=0, started=ago(seconds=5))])
+        plugin = self.start()
+        self.open(plugin, widget="b1", token=TOKEN, apps="app1")
+        self.open(plugin, widget="b2", token=TOKEN, apps="app2")
+        self.refresh(plugin, widget="b1")
+        self.refresh(plugin, widget="b2")
+        self.frame(plugin, widget="b1", visible=False)
+        plugin.updates_for(0.2)
+        pushed = plugin.updates_for(1.5)
+        self.assertTrue(pushed)
+        for update in pushed:
+            self.assertEqual(update["widget"], "b2")
+            self.assertEqual([i["id"] for i in update["payload"]["items"]], ["r-2"])
 
     def test_an_unknown_action_is_a_jsonrpc_error(self):
         plugin = self.start()

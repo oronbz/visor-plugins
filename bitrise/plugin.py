@@ -9,13 +9,17 @@ import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 API_URL = os.environ.get("BITRISE_API_URL", "https://api.bitrise.io/v0.1").rstrip("/")
 TIMEOUT = 15
+TICK = 1
+BACK_OFF = 60
+FAST_POLL = float(os.environ.get("BITRISE_FAST_POLL", "15"))
 
 RUNNING, ON_HOLD, SUCCEEDED, FAILED, ABORTED = "running", "on hold", "succeeded", "failed", "aborted"
 GLYPHS = {
@@ -36,6 +40,8 @@ COLUMNS = [
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 widgets = {}
+lives = {}
+live_lock = threading.Lock()
 write_lock = threading.Lock()
 
 
@@ -47,10 +53,11 @@ class RPCError(Exception):
 
 
 class BitriseError(Exception):
-    def __init__(self, code, path):
+    def __init__(self, code, path, retry_after=None):
         super().__init__("Bitrise answered %s for %s" % (code, path))
         self.code = code
         self.path = path
+        self.retry_after = retry_after
 
 
 class UnknownApp(Exception):
@@ -75,7 +82,7 @@ def get(token, path, query=None):
         with urlopen(req, timeout=TIMEOUT) as resp:
             return json.load(resp)
     except HTTPError as e:
-        raise BitriseError(e.code, path) from None
+        raise BitriseError(e.code, path, e.headers.get("Retry-After")) from None
 
 
 def parse_time(s):
@@ -162,6 +169,26 @@ def failure(message, reason, hint=None):
     return {"status": status}
 
 
+def back_off_until(retry_after):
+    now = datetime.now(timezone.utc)
+    until = None
+    if retry_after:
+        try:
+            until = now + timedelta(seconds=int(retry_after))
+        except ValueError:
+            try:
+                until = parsedate_to_datetime(retry_after)
+            except (TypeError, ValueError):
+                pass
+    if until is None or until.tzinfo is None:
+        until = now + timedelta(seconds=BACK_OFF)
+    return until
+
+
+def rate_limited(until):
+    return {"status": {"state": "rate_limited", "until": until.strftime("%Y-%m-%dT%H:%M:%SZ")}}
+
+
 def setup(message, action=None):
     status = {"state": "setup", "message": message}
     if action:
@@ -169,7 +196,8 @@ def setup(message, action=None):
     return {"status": status}
 
 
-def refresh(widget):
+def load(widget):
+    """The Widget's (titles, builds) from Bitrise, or a status-only answer."""
     settings = widgets.get(widget, {})
     token = os.environ.get("BITRISE_TOKEN") or settings.get("token")
     if not token:
@@ -187,19 +215,122 @@ def refresh(widget):
     except BitriseError as e:
         if e.code in (401, 403):
             return setup("Bitrise rejected the token (%d); set a new one" % e.code, "secret:token")
+        if e.code == 429:
+            return rate_limited(back_off_until(e.retry_after))
         return failure(str(e), "Bitrise %d" % e.code)
     except (URLError, OSError, ValueError) as e:
         return failure("Couldn't reach Bitrise: %s" % getattr(e, "reason", e), "offline")
     titles = [title for title, _ in fetched]
     lists = [builds for _, builds in fetched]
-    builds = sorted((b for bs in lists for b in bs), key=order)[:limit]
+    return titles, sorted((b for bs in lists for b in bs), key=order)[:limit]
+
+
+def payload(titles, builds):
     now = datetime.now(timezone.utc)
-    return {"payload": {
+    return {
         "columns": COLUMNS,
         "items": [item(b, now) for b in builds],
         "count": sum(1 for b in builds if b["state"] == RUNNING),
         "empty": "No builds in " + ", ".join(titles),
-    }}
+    }
+
+
+class Live:
+    """A Widget's last builds and the timers that keep them fresh while it's visible."""
+
+    def __init__(self, widget, visible):
+        self.widget = widget
+        self.visible = visible
+        self.closed = threading.Event()
+        self.titles = []
+        self.builds = []
+        self.failed = False
+        self.ticker = None
+        self.poller = None
+        self.limit = None
+
+    def take(self, loaded):
+        if isinstance(loaded, dict):
+            self.failed = True
+            state = loaded["status"]["state"]
+            if state == "setup":
+                self.builds = []
+            if state == "rate_limited":
+                self.limit = loaded
+            return loaded
+        self.failed = False
+        self.titles, self.builds = loaded
+        return {"payload": payload(self.titles, self.builds)}
+
+    def ticking(self):
+        return (self.visible and not self.failed and not self.closed.is_set()
+                and any(b["state"] == RUNNING for b in self.builds))
+
+    def limited(self):
+        """The rate_limited answer while Bitrise's back-off lasts, else None."""
+        if self.limit:
+            until = datetime.strptime(self.limit["status"]["until"], "%Y-%m-%dT%H:%M:%SZ")
+            if datetime.now(timezone.utc) < until.replace(tzinfo=timezone.utc):
+                return self.limit
+            self.limit = None
+        return None
+
+    def polling(self):
+        return (self.visible and not self.closed.is_set()
+                and any(b["state"] in (RUNNING, ON_HOLD) for b in self.builds))
+
+    def keep(self):
+        if self.ticking() and self.ticker is None:
+            self.ticker = threading.Thread(target=self.tick, daemon=True)
+            self.ticker.start()
+        if self.polling() and self.poller is None:
+            self.poller = threading.Thread(target=self.poll, daemon=True)
+            self.poller.start()
+
+    def poll(self):
+        while not self.closed.wait(FAST_POLL):
+            with live_lock:
+                if not self.polling():
+                    self.poller = None
+                    return
+                if self.limited():
+                    continue
+            loaded = load(self.widget)
+            with live_lock:
+                if self.closed.is_set():
+                    return
+                update = self.take(loaded)
+                if self.visible:
+                    self.push(update)
+                self.keep()
+
+    def tick(self):
+        while not self.closed.wait(TICK):
+            with live_lock:
+                if not self.ticking():
+                    self.ticker = None
+                    return
+                self.push({"payload": payload(self.titles, self.builds)})
+
+    def push(self, update):
+        update["widget"] = self.widget
+        send({"method": "widget/update", "params": update})
+
+
+def refresh(widget):
+    with live_lock:
+        live = lives.get(widget)
+        limit = live and live.limited()
+    if limit:
+        return limit
+    loaded = load(widget)
+    with live_lock:
+        live = lives.get(widget)
+        if live is None:
+            return Live(widget, False).take(loaded)
+        update = live.take(loaded)
+        live.keep()
+        return update
 
 
 def handle(method, params):
@@ -207,10 +338,23 @@ def handle(method, params):
         return {"protocol": 1}
     if method == "widget/open":
         widgets[params["widget"]] = params.get("settings") or {}
+        with live_lock:
+            old = lives.get(params["widget"])
+            if old:
+                old.closed.set()
+            lives[params["widget"]] = Live(params["widget"], params.get("visible", True))
     elif method == "widget/close":
         widgets.pop(params["widget"], None)
+        with live_lock:
+            live = lives.pop(params["widget"], None)
+            if live:
+                live.closed.set()
     elif method == "widget/frame":
-        pass
+        with live_lock:
+            live = lives.get(params["widget"])
+            if live:
+                live.visible = params.get("visible", True)
+                live.keep()
     elif method == "widget/refresh":
         return refresh(params["widget"])
     elif method in ("action/invoke", "action/choices"):
