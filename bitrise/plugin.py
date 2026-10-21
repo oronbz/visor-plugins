@@ -40,6 +40,8 @@ COLUMNS = [
 
 WATCH = {"id": "watch", "label": "Watch app…", "input": "choice"}
 
+GARBLED = "The Bitrise token has characters no token has; set a new one"
+
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 widgets = {}
@@ -222,12 +224,18 @@ def resolve(token, apps):
 
 
 def token_of(settings):
-    return os.environ.get("BITRISE_TOKEN") or settings.get("token")
+    return (os.environ.get("BITRISE_TOKEN") or settings.get("token") or "").strip()
+
+
+def garbled(token):
+    return not (token.isascii() and token.isprintable())
 
 
 def apps_for_action(token):
     if not token:
         raise RPCError(-32000, "Set a Bitrise token first")
+    if garbled(token):
+        raise RPCError(-32000, GARBLED)
     try:
         return list_apps(token)
     except BitriseError as e:
@@ -295,6 +303,8 @@ def load(widget):
     token = token_of(settings)
     if not token:
         return setup("Set a Bitrise personal access token", "secret:token")
+    if garbled(token):
+        return setup(GARBLED, "secret:token")
     apps = watched(settings)
     if not apps:
         return setup("Pick the Bitrise apps to watch", WATCH)
@@ -465,6 +475,8 @@ def invoke(params):
     if b is None:
         raise RPCError(-32602, "no build `%s` on this Widget" % params.get("item"))
     token = token_of(widgets.get(params["widget"], {}))
+    if garbled(token):
+        raise RPCError(-32000, GARBLED)
     try:
         return INVOKES[action](token, b)
     except BitriseError as e:

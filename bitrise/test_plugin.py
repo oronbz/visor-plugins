@@ -369,6 +369,26 @@ class BitriseTest(unittest.TestCase):
         self.assertEqual([i["id"] for i in self.items(self.refresh(plugin))], ["b-1"])
         self.assertTrue(all(r["authorization"] == TOKEN for r in self.bitrise.requests))
 
+    def test_a_token_pasted_with_a_line_break_still_works(self):
+        self.bitrise.app("app1", "Rider iOS", [build("b-1")])
+        plugin = self.start()
+        for token in (TOKEN + "\n", " " + TOKEN + "\r\n"):
+            with self.subTest(token=token):
+                self.open(plugin, token=token, apps="app1")
+                self.assertEqual([i["id"] for i in self.items(self.refresh(plugin))], ["b-1"])
+        self.assertTrue(all(r["authorization"] == TOKEN for r in self.bitrise.requests))
+
+    def test_a_token_no_header_can_carry_asks_for_a_new_one_without_echoing_it(self):
+        self.bitrise.app("app1", "Rider iOS", [build("b-1")])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN + "\nX-Evil: 1", apps="app1")
+        status = self.refresh(plugin)["status"]
+        self.assertEqual(status["state"], "setup")
+        self.assertEqual(status["action"], "secret:token")
+        answer = plugin.request("action/choices", {"widget": "b1", "action": "watch"})
+        self.assertIn("token", answer["error"]["message"])
+        self.assertEqual(self.bitrise.requests, [])
+
     def test_a_rejected_token_asks_for_a_new_one(self):
         self.bitrise.app("app1", "Rider iOS", [build("b-1")])
         for code in (401, 403):
