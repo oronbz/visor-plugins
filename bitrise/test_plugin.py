@@ -44,6 +44,7 @@ class FakeBitrise:
         self.apps = {}
         self.fail = {}
         self.gate = None
+        self.page = 50
         self.requests = []
         fake = self
 
@@ -59,7 +60,8 @@ class FakeBitrise:
                     "query": {k: v[0] for k, v in parse_qs(url.query).items()},
                     "authorization": self.headers.get("Authorization"),
                 })
-                code, body = fake.answer(url.path, self.headers.get("Authorization"))
+                code, body = fake.answer(url.path, self.headers.get("Authorization"),
+                                         fake.requests[-1]["query"])
                 data = json.dumps(body).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
@@ -78,11 +80,13 @@ class FakeBitrise:
     def app(self, slug, title, builds=()):
         self.apps[slug] = {"title": title, "builds": list(builds)}
 
-    def answer(self, path, auth):
+    def answer(self, path, auth, query):
         if path in self.fail:
             return self.fail[path], {"message": "nope"}
         if auth != TOKEN:
             return 401, {"message": "Unauthorized"}
+        if path == "/v0.1/apps":
+            return 200, self.app_page(query.get("next"))
         parts = path.split("/")
         if len(parts) >= 4 and parts[1] == "v0.1" and parts[2] == "apps":
             app = self.apps.get(parts[3])
@@ -98,6 +102,16 @@ class FakeBitrise:
                         return 500, {"message": "builds were fetched one app at a time"}
                 return 200, {"data": app["builds"], "paging": {"total_item_count": 0}}
         return 404, {"message": "Not Found"}
+
+
+    def app_page(self, after):
+        slugs = sorted(self.apps)
+        start = slugs.index(after) if after in slugs else 0
+        page = slugs[start:start + self.page]
+        paging = {"total_item_count": len(slugs), "page_item_limit": self.page}
+        if start + self.page < len(slugs):
+            paging["next"] = slugs[start + self.page]
+        return {"data": [{"slug": s, "title": self.apps[s]["title"]} for s in page], "paging": paging}
 
 
 class Plugin:
@@ -307,8 +321,15 @@ class BitriseTest(unittest.TestCase):
         self.open(plugin, token=TOKEN, apps=" , ")
         status = self.refresh(plugin)["status"]
         self.assertEqual(status["state"], "setup")
-        self.assertIn("apps", status["message"])
+        self.assertEqual(status["action"], {"id": "watch", "label": "Watch app…", "input": "choice"})
         self.assertEqual(self.bitrise.requests, [])
+
+    def test_the_list_offers_watch_app(self):
+        self.bitrise.app("app1", "Rider iOS", [build("b-1")])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        actions = self.refresh(plugin)["payload"]["actions"]
+        self.assertIn({"id": "watch", "label": "Watch app…", "input": "choice"}, actions)
 
     def test_an_app_bitrise_does_not_know_is_an_error_naming_it(self):
         self.bitrise.app("app1", "Rider iOS", [build("b-1")])
@@ -317,6 +338,22 @@ class BitriseTest(unittest.TestCase):
         status = self.refresh(plugin)["status"]
         self.assertEqual(status["state"], "error")
         self.assertIn("typo-slug", status["message"])
+
+    def test_app_titles_watch_their_apps_whatever_their_case(self):
+        self.bitrise.app("app1", "Rider iOS", [build("b-1")])
+        self.bitrise.app("app2", "Driver Android", [build("b-2")])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="rider IOS, app2")
+        self.assertEqual({i["id"] for i in self.items(self.refresh(plugin))}, {"b-1", "b-2"})
+        self.assertIn("/v0.1/apps/app1/builds", [r["path"] for r in self.bitrise.requests])
+
+    def test_a_title_matching_no_app_is_an_error_naming_it(self):
+        self.bitrise.app("app1", "Rider iOS", [build("b-1")])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="Rider iOS, Rider Android")
+        status = self.refresh(plugin)["status"]
+        self.assertEqual(status["state"], "error")
+        self.assertIn("Rider Android", status["message"])
 
     def test_a_bitrise_failure_is_an_error_without_a_payload(self):
         self.bitrise.app("app1", "Rider iOS", [build("b-1")])
@@ -350,6 +387,49 @@ class BitriseTest(unittest.TestCase):
         self.open(plugin, apps="app1")
         self.open(plugin, token=TOKEN, apps="app1")
         self.assertEqual([i["id"] for i in self.items(self.refresh(plugin))], ["b-1"])
+
+    def choices(self, plugin, widget="b1"):
+        answer = plugin.request("action/choices", {"widget": widget, "action": "watch"})
+        self.assertNotIn("error", answer)
+        return answer["result"]["choices"]
+
+    def test_watch_app_offers_the_apps_the_token_sees_but_not_the_watched_ones(self):
+        self.bitrise.app("app1", "Rider iOS")
+        self.bitrise.app("app2", "Driver Android")
+        self.bitrise.app("app3", "Back Office")
+        self.bitrise.page = 2
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.assertEqual(self.choices(plugin), [
+            {"id": "app3", "label": "Back Office"},
+            {"id": "app2", "label": "Driver Android"},
+        ])
+
+    def test_watch_app_without_a_token_says_so_without_asking_bitrise(self):
+        plugin = self.start()
+        self.open(plugin)
+        answer = plugin.request("action/choices", {"widget": "b1", "action": "watch"})
+        self.assertIn("token", answer["error"]["message"])
+        self.assertEqual(self.bitrise.requests, [])
+
+    def test_watch_app_with_a_rejected_token_says_so(self):
+        self.bitrise.app("app1", "Rider iOS")
+        plugin = self.start()
+        self.open(plugin, token="a-stale-token")
+        answer = plugin.request("action/choices", {"widget": "b1", "action": "watch"})
+        self.assertIn("rejected", answer["error"]["message"])
+
+    def test_picking_an_app_appends_its_slug_to_the_apps_setting(self):
+        self.bitrise.app("app1", "Rider iOS")
+        self.bitrise.app("app2", "Driver Android")
+        plugin = self.start()
+        for apps, written in (("app1", "app1, app2"), ("", "app2")):
+            with self.subTest(apps=apps):
+                self.open(plugin, token=TOKEN, apps=apps)
+                [choice] = [c for c in self.choices(plugin) if c["id"] == "app2"]
+                answer = plugin.request("action/invoke", {"widget": "b1", "action": "watch", "choice": choice["id"]})
+                self.assertEqual(answer["result"]["settings"], {"apps": written})
+                self.assertIn("Driver Android", answer["result"]["toast"])
 
     def test_an_unknown_action_is_a_jsonrpc_error(self):
         plugin = self.start()

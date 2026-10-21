@@ -21,7 +21,7 @@ target = "https://app.bitrise.io/me/account/security"
 name = "apps"
 kind = "string"
 default = ""
-description = "The Bitrise app slugs to watch, comma-separated"
+description = "The Bitrise apps to watch, by slug or title, comma-separated"
 
 [[widget.setting]]
 name = "limit"

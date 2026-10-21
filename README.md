@@ -14,7 +14,7 @@ Running builds first, then builds on hold, then the latest finished ones, across
 
 | Setting | Default | |
 |---|---|---|
-| `apps` | `""` | Bitrise app slugs to watch, comma-separated |
+| `apps` | `""` | Bitrise apps to watch, by slug or title (any case), comma-separated; "Watch app…" adds one |
 | `limit` | `10` | The most builds listed |
 | `token` | | Your Bitrise [personal access token](https://app.bitrise.io/me/account/security), set through the Widget's "Set token" Action and kept in your OS keyring. `BITRISE_TOKEN` in the environment takes its place. |
 
