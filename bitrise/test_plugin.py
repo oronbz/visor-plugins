@@ -67,6 +67,23 @@ class FakeBitrise:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"null")
+                fake.requests.append({
+                    "method": "POST",
+                    "path": self.path,
+                    "body": body,
+                    "authorization": self.headers.get("Authorization"),
+                })
+                code, answer = fake.answer_post(self.path, self.headers.get("Authorization"))
+                data = json.dumps(answer).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = "http://127.0.0.1:%d/v0.1" % self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -98,6 +115,26 @@ class FakeBitrise:
                         return 500, {"message": "builds were fetched one app at a time"}
                 return 200, {"data": app["builds"], "paging": {"total_item_count": 0}}
         return 404, {"message": "Not Found"}
+
+
+    def answer_post(self, path, auth):
+        if path in self.fail:
+            return self.fail[path], {"message": "nope"}
+        if auth != TOKEN:
+            return 401, {"message": "Unauthorized"}
+        parts = path.split("/")
+        if len(parts) < 5 or parts[2] != "apps" or parts[3] not in self.apps or parts[4] != "builds":
+            return 404, {"message": "Not Found"}
+        if len(parts) == 7 and parts[6] == "abort":
+            return 200, {"status": "ok"}
+        if len(parts) == 5:
+            return 201, {"status": "ok", "message": "webhook processed", "results": [
+                {"status": "ok", "build_slug": "new-build", "build_number": 412,
+                 "triggered_workflow": "primary"}]}
+        return 404, {"message": "Not Found"}
+
+    def posts(self):
+        return [r for r in self.requests if r["method"] == "POST"]
 
 
 class Plugin:
@@ -350,6 +387,115 @@ class BitriseTest(unittest.TestCase):
         self.open(plugin, apps="app1")
         self.open(plugin, token=TOKEN, apps="app1")
         self.assertEqual([i["id"] for i in self.items(self.refresh(plugin))], ["b-1"])
+
+    def actions(self, item):
+        return {a["id"]: a for a in item.get("actions", [])}
+
+    def test_a_finished_branch_build_opens_copies_and_rebuilds(self):
+        self.bitrise.app("app1", "Rider iOS", [build("b-1", status=2)])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        [item] = self.items(self.refresh(plugin))
+        actions = self.actions(item)
+        self.assertEqual(sorted(actions), ["copy", "open", "rebuild"])
+        url = "https://app.bitrise.io/build/b-1"
+        self.assertEqual(actions["open"], {
+            "id": "open", "label": "Open build", "primary": True, "verb": "open", "target": url})
+        self.assertEqual(actions["copy"], {
+            "id": "copy", "key": "y", "label": "Copy build URL", "verb": "copy", "target": url})
+        self.assertEqual(actions["rebuild"], {
+            "id": "rebuild", "key": "R", "label": "Rebuild", "confirm": True})
+
+    def test_a_running_pr_build_also_opens_its_pr_and_aborts(self):
+        self.bitrise.app("app1", "Rider iOS", [
+            build("run", status=0, pr=4921),
+            build("held", status=0, on_hold=True),
+        ])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        items = {i["id"]: self.actions(i) for i in self.items(self.refresh(plugin))}
+        self.assertEqual(sorted(items["run"]), ["abort", "copy", "open", "pr", "rebuild"])
+        self.assertEqual(items["run"]["pr"], {
+            "id": "pr", "key": "p", "label": "Open pull request", "verb": "open",
+            "target": "https://github.com/o/r/pull/4921"})
+        self.assertEqual(items["run"]["abort"], {
+            "id": "abort", "key": "x", "label": "Abort build", "confirm": True})
+        self.assertEqual(sorted(items["held"]), ["abort", "copy", "open", "rebuild"])
+
+    def invoke(self, plugin, action, item, widget="b1"):
+        return plugin.request("action/invoke", {"widget": widget, "action": action, "item": item})
+
+    def test_abort_stops_the_build_and_says_so(self):
+        self.bitrise.app("app1", "Rider iOS", [build("run", status=0, workflow="test_pr")])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        result = self.invoke(plugin, "abort", "run")["result"]
+        self.assertEqual(self.bitrise.posts(), [{
+            "method": "POST",
+            "path": "/v0.1/apps/app1/builds/run/abort",
+            "body": {"abort_reason": "Aborted from visor", "abort_with_success": False,
+                     "skip_git_status_report": False, "skip_notifications": False},
+            "authorization": TOKEN,
+        }])
+        self.assertEqual(result, {"toast": "Aborted test_pr on Rider iOS"})
+
+    def rebuild_body(self, b):
+        self.bitrise.app("app1", "Rider iOS", [b])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        result = self.invoke(plugin, "rebuild", b["slug"])["result"]
+        self.assertEqual(result, {"toast": "Rebuilding test_pr on Rider iOS"})
+        [request] = self.bitrise.posts()
+        self.assertEqual(request["path"], "/v0.1/apps/app1/builds")
+        self.assertEqual(request["authorization"], TOKEN)
+        self.assertEqual(request["body"]["hook_info"], {"type": "bitrise"})
+        return request["body"]["build_params"]
+
+    def test_rebuild_resends_the_original_build_params(self):
+        original = {
+            "branch": "feature/x", "commit_hash": "abc123", "workflow_id": "test_pr",
+            "pull_request_id": 4921, "branch_dest": "main",
+            "pull_request_merge_branch": "pull/4921/merge",
+            "environments": [{"mapped_to": "FLAVOR", "value": "qa", "is_expand": True}],
+        }
+        b = build("b-1", status=2, workflow="test_pr", branch="feature/x", pr=4921)
+        b.update({"commit_hash": "abc123", "original_build_params": original})
+        self.assertEqual(self.rebuild_body(b), original)
+
+    def test_rebuild_without_original_params_reruns_the_branch_workflow_and_commit(self):
+        b = build("b-1", status=2, workflow="test_pr", branch="feature/x")
+        b["commit_hash"] = "abc123"
+        self.assertEqual(self.rebuild_body(b), {
+            "branch": "feature/x", "workflow_id": "test_pr", "commit_hash": "abc123"})
+
+    def test_rebuild_of_a_pr_build_without_original_params_keeps_the_pr(self):
+        b = build("b-1", status=2, workflow="test_pr", branch="feature/x", pr=4921)
+        b.update({"commit_hash": "abc123", "pull_request_target_branch": "main"})
+        self.assertEqual(self.rebuild_body(b), {
+            "branch": "feature/x", "workflow_id": "test_pr", "commit_hash": "abc123",
+            "pull_request_id": 4921, "branch_dest": "main"})
+
+    def test_an_abort_bitrise_refuses_is_a_jsonrpc_error(self):
+        self.bitrise.app("app1", "Rider iOS", [build("run", status=0)])
+        self.bitrise.fail = {"/v0.1/apps/app1/builds/run/abort": 400}
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        answer = self.invoke(plugin, "abort", "run")
+        self.assertNotIn("result", answer)
+        self.assertIn("400", answer["error"]["message"])
+
+    def test_an_action_on_a_build_not_listed_is_a_jsonrpc_error(self):
+        self.bitrise.app("app1", "Rider iOS", [build("b-1")])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        self.refresh(plugin)
+        answer = self.invoke(plugin, "rebuild", "gone")
+        self.assertNotIn("result", answer)
+        self.assertIn("gone", answer["error"]["message"])
+        self.assertEqual(self.bitrise.posts(), [])
 
     def test_an_unknown_action_is_a_jsonrpc_error(self):
         plugin = self.start()
