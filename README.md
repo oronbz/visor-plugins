@@ -35,7 +35,7 @@ Watch app… and Set token are in the Widget's Actions and the `^K` palette:
 
 **Token.** Create a personal access token at [app.bitrise.io/me/account/security](https://app.bitrise.io/me/account/security), then run Set token. visor keeps it in your OS keyring (Keychain, Secret Service or Credential Manager), never in `config.toml`, and every `bitrise` Widget shares it. If `BITRISE_TOKEN` is set in visor's environment, it's used instead; that's the way in on a machine with no keyring. With no token, the Widget asks you to set one. If Bitrise rejects it, the Widget asks for a new one.
 
-**Refresh.** Every 2 minutes. While a build is running or on hold and the Widget is on screen, it checks Bitrise every 15 seconds, and a running build's timer ticks every second without asking Bitrise. Each check makes two requests per watched app. When Bitrise rate-limits it, it waits as long as Bitrise asks, or a minute.
+**Refresh.** Every 2 minutes. While a build is running or on hold and the Widget is on screen, it checks Bitrise every 15 seconds, and a running build's timer ticks every second without asking Bitrise. Each check makes one request per watched app. When Bitrise rate-limits it, it waits as long as Bitrise asks, or a minute.
 
 | Setting | Default | |
 |---|---|---|

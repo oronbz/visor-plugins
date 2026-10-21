@@ -113,8 +113,6 @@ class FakeBitrise:
             app = self.apps.get(parts[3])
             if app is None:
                 return 404, {"message": "Not Found"}
-            if len(parts) == 4:
-                return 200, {"data": {"slug": parts[3], "title": app["title"]}}
             if len(parts) == 5 and parts[4] == "builds":
                 if self.gate:
                     try:
@@ -324,6 +322,19 @@ class BitriseTest(unittest.TestCase):
         result = self.refresh(plugin)
         self.assertEqual(len(self.items(result)), 2)
         self.assertEqual(result["payload"]["count"], 4)
+
+    def test_each_refresh_asks_bitrise_once_per_watched_app(self):
+        self.bitrise.app("app1", "Rider iOS", [build("b-1")])
+        self.bitrise.app("app2", "Driver Android", [build("b-2")])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1, Driver Android")
+        self.assertEqual(self.items(self.refresh(plugin))[0]["fields"][1][0]["text"], "Rider iOS")
+        self.assertEqual(sorted(r["path"] for r in self.bitrise.requests),
+                         ["/v0.1/apps", "/v0.1/apps/app1/builds", "/v0.1/apps/app2/builds"])
+        del self.bitrise.requests[:]
+        self.refresh(plugin)
+        self.assertEqual(sorted(r["path"] for r in self.bitrise.requests),
+                         ["/v0.1/apps/app1/builds", "/v0.1/apps/app2/builds"])
 
     def test_each_status_has_its_glyph_and_colour(self):
         self.bitrise.app("app1", "Rider iOS", [

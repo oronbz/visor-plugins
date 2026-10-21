@@ -176,15 +176,15 @@ def item(b, now):
     }
 
 
-def fetch(token, slug, limit):
-    path = "/apps/%s" % quote(slug, safe="")
+def fetch(token, app, limit):
+    slug, title = app
+    path = "/apps/%s/builds" % quote(slug, safe="")
     try:
-        title = get(token, path)["data"].get("title") or slug
+        builds = get(token, path, {"sort_by": "running_first", "limit": limit})["data"]
     except BitriseError as e:
         if e.code == 404:
             raise UnknownApp(slug) from None
         raise
-    builds = get(token, path + "/builds", {"sort_by": "running_first", "limit": limit})["data"]
     for b in builds:
         b["app"] = title
         b["app_slug"] = slug
@@ -212,12 +212,13 @@ def resolve(token, apps):
     key = tuple(apps)
     if key not in resolved:
         listed = list_apps(token)
-        lookup = {(a.get("title") or "").lower(): a["slug"] for a in listed}
-        lookup.update((a["slug"].lower(), a["slug"]) for a in listed)
+        lookup = {(a.get("title") or "").lower(): a for a in listed}
+        lookup.update((a["slug"].lower(), a) for a in listed)
         missing = [a for a in apps if a.lower() not in lookup]
         if missing:
             raise UnknownApp(missing[0])
-        slugs = list(dict.fromkeys(lookup[a.lower()] for a in apps))
+        found = [lookup[a.lower()] for a in apps]
+        slugs = list(dict.fromkeys((a["slug"], a.get("title") or a["slug"]) for a in found))
         with live_lock:
             resolved[key] = slugs
     return resolved[key]
@@ -332,7 +333,7 @@ def load(widget):
     try:
         apps = resolve(token, apps)
         with ThreadPoolExecutor(max_workers=len(apps)) as pool:
-            fetched = list(pool.map(lambda slug: fetch(token, slug, limit), apps))
+            fetched = list(pool.map(lambda app: fetch(token, app, limit), apps))
     except UnknownApp as e:
         raise Problem(failure("Bitrise has no app `%s` this token can see" % e.slug, "unknown app",
                               "Check the slugs and titles in this Widget's apps setting")) from None
