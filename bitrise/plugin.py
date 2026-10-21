@@ -347,16 +347,17 @@ def load(widget):
         raise Problem(failure("Couldn't reach Bitrise: %s" % getattr(e, "reason", e), "offline")) from None
     titles = [title for title, _ in fetched]
     lists = [builds for _, builds in fetched]
-    builds = sorted((b for bs in lists for b in bs), key=order)[:limit]
-    return titles, builds
+    every = [b for bs in lists for b in bs]
+    running = sum(1 for b in every if b["state"] == RUNNING)
+    return titles, sorted(every, key=order)[:limit], running
 
 
-def payload(titles, builds):
+def payload(titles, builds, running):
     now = datetime.now(timezone.utc)
     return {
         "columns": COLUMNS,
         "items": [item(b, now) for b in builds],
-        "count": sum(1 for b in builds if b["state"] == RUNNING),
+        "count": running,
         "empty": "No builds in " + ", ".join(titles),
         "actions": [WATCH],
     }
@@ -373,6 +374,7 @@ class Live:
         self.sending = threading.Lock()
         self.titles = []
         self.builds = []
+        self.running = 0
         self.failed = False
         self.ticker = None
         self.poller = None
@@ -388,7 +390,7 @@ class Live:
                 self.limit = update
             return
         self.failed = False
-        self.titles, self.builds = loaded
+        self.titles, self.builds, self.running = loaded
 
     def ticking(self):
         return (self.visible and not self.failed and not self.closed.is_set()
@@ -435,7 +437,7 @@ class Live:
         if not self.ticking():
             self.ticker = None
             return None
-        return {"payload": payload(self.titles, self.builds)}
+        return {"payload": payload(self.titles, self.builds, self.running)}
 
     def push(self, make):
         """Sends make()'s update, made under live_lock, unless the Widget has closed."""

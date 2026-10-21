@@ -316,6 +316,15 @@ class BitriseTest(unittest.TestCase):
             if r["path"].endswith("/builds"):
                 self.assertEqual(r["query"]["limit"], "4")
 
+    def test_the_count_is_every_running_build_even_those_past_the_limit(self):
+        self.bitrise.app("app1", "Rider iOS", [build("r-%d" % n, status=0) for n in range(3)])
+        self.bitrise.app("app2", "Driver Android", [build("r-9", status=0), build("h-1", status=0, on_hold=True)])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1, app2", limit=2)
+        result = self.refresh(plugin)
+        self.assertEqual(len(self.items(result)), 2)
+        self.assertEqual(result["payload"]["count"], 4)
+
     def test_each_status_has_its_glyph_and_colour(self):
         self.bitrise.app("app1", "Rider iOS", [
             build("running", status=0),
