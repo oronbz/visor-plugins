@@ -18,7 +18,7 @@ The Widget's count is the number of running builds.
 visor plugin install bitrise
 ```
 
-That's the same as `visor plugin install oronbz/visor-plugins/bitrise`. Then in visor, press `ctrl+k` and pick Add Bitrise Widget. Focus the new Widget and press Enter to set your token, then Enter again to pick the apps to watch.
+That's the same as `visor plugin install oronbz/visor-plugins/bitrise`. Install adds a Bitrise Widget to your dashboard. Focus it and press Enter to set your token, then Enter again to pick the apps to watch.
 
 Needs `python3` 3.9 or later on your `PATH`.
 

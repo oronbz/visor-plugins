@@ -14,7 +14,7 @@ Plugins need `python3` (3.9 or later) on your `PATH`. Windows doesn't come with 
 visor plugin install <name>
 ```
 
-A bare name is a folder of this repo, so `visor plugin install bitrise` is the same as `visor plugin install oronbz/visor-plugins/bitrise`. Then in visor, press `ctrl+k` and pick Add <Plugin> Widget. Each Plugin's page says how to set it up.
+A bare name is a folder of this repo, so `visor plugin install bitrise` is the same as `visor plugin install oronbz/visor-plugins/bitrise`. Install adds the Plugin's Widget to your dashboard. Each Plugin's page says how to set it up.
 
 ## Develop
 
