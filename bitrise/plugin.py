@@ -31,14 +31,14 @@ GLYPHS = {
     ON_HOLD: ("◌", "warn"),
     SUCCEEDED: ("✓", "ok"),
     FAILED: ("✗", "bad"),
-    ABORTED: ("⊘", "faint"),
+    ABORTED: ("○", "faint"),
 }
 COLUMNS = [
     {"priority": 0},
-    {"priority": 1},
     {"priority": 2},
-    {"priority": 3, "flex": True},
-    {"priority": 4, "right": True},
+    {"priority": 1, "flex": True},
+    {"priority": 4},
+    {"priority": 3, "right": True},
 ]
 
 WATCH = {"id": "watch", "label": "Watch app…", "input": "choice"}
@@ -216,16 +216,21 @@ def actions(build):
     return out
 
 
+def title(build):
+    """The first line of the commit message, which on a PR build is the PR's title."""
+    message = (build.data.get("commit_message") or "").strip()
+    return message.splitlines()[0].strip() if message else build.data.get("branch") or ""
+
+
 def item(build, now):
     glyph, token = GLYPHS[build.state]
-    pr = build.data.get("pull_request_id")
     return {
         "id": build.slug,
         "fields": [
             [{"text": glyph, "token": token}],
             [{"text": build.app, "token": "dim"}],
-            [{"text": build.data.get("triggered_workflow") or "", "token": "fg"}],
-            [{"text": "#%d" % pr if pr else build.data.get("branch") or "", "token": "fg"}],
+            [{"text": title(build), "token": "fg"}],
+            [{"text": build.data.get("triggered_workflow") or "", "token": "dim"}],
             [{"text": elapsed(build, now), "token": "faint"}],
         ],
         "actions": actions(build),

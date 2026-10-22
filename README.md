@@ -12,11 +12,13 @@ Plugins need `python3` (3.9 or later) on your `PATH`. Windows doesn't come with 
 
 The builds of every Bitrise app you watch, in one list: running builds first, then builds on hold, then the latest finished ones, newest first in each group. Each Item has:
 
-- a status glyph: ● running (accent), ◌ on hold (warn), ✓ succeeded (ok), ✗ failed (bad), ⊘ aborted (faint)
+- a status glyph: ● running (accent), ◌ on hold (warn), ✓ succeeded (ok), ✗ failed (bad), ○ aborted (faint)
 - the app, dimmed
-- the workflow
-- the branch, or `#<number>` for a pull request build
+- the title: the first line of the commit message, which on a pull request build is the pull request's title, or the branch when there's no message
+- the workflow, dimmed
 - for a running or on-hold build, how long it's been going; for a finished one, how long ago it ended
+
+The title takes the spare width. In a narrow tile the workflow goes first, then the time, then the app.
 
 The Widget's count is the number of running builds.
 

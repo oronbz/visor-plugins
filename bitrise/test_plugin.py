@@ -20,7 +20,7 @@ def ago(**kw):
 
 
 def build(slug, status=1, on_hold=False, workflow="primary", branch="main", pr=None,
-          triggered=None, started=None, finished=None):
+          message=None, triggered=None, started=None, finished=None):
     b = {
         "slug": slug,
         "status": status,
@@ -28,6 +28,7 @@ def build(slug, status=1, on_hold=False, workflow="primary", branch="main", pr=N
         "triggered_workflow": workflow,
         "branch": branch,
         "pull_request_id": pr or 0,
+        "commit_message": message,
         "pull_request_view_url": "https://github.com/o/r/pull/%d" % pr if pr else None,
         "triggered_at": triggered or ago(hours=1),
         "started_on_worker_at": started,
@@ -299,19 +300,20 @@ class BitriseTest(unittest.TestCase):
         self.assertEqual(status["action"], "secret:token")
         self.assertEqual(self.bitrise.requests, [])
 
-    def test_a_finished_build_shows_its_status_app_workflow_branch_and_age(self):
+    def test_a_finished_build_shows_its_status_app_title_workflow_and_age(self):
         self.bitrise.app("app1", "Rider iOS", [
             build("b-1", status=2, workflow="test_pr", branch="feature/x",
+                  message="Fix the login screen\n\nIt was cut off.",
                   finished=ago(minutes=5, seconds=10)),
         ])
         plugin = self.start()
         self.open(plugin, token=TOKEN, apps="app1")
         [item] = self.items(self.refresh(plugin))
         self.assertEqual(item["id"], "b-1")
-        self.assertEqual(self.texts(item), ["✗", "Rider iOS", "test_pr", "feature/x", "5m ago"])
-        self.assertEqual(item["fields"][0][0]["token"], "bad")
-        self.assertEqual(item["fields"][1][0]["token"], "dim")
-        self.assertEqual(item["fields"][4][0]["token"], "faint")
+        self.assertEqual(self.texts(item),
+                         ["✗", "Rider iOS", "Fix the login screen", "test_pr", "5m ago"])
+        self.assertEqual([f[0]["token"] for f in item["fields"]],
+                         ["bad", "dim", "fg", "dim", "faint"])
         builds = [r for r in self.bitrise.requests if r["path"] == "/v0.1/apps/app1/builds"]
         self.assertEqual(len(builds), 1)
         self.assertEqual(builds[0]["query"], {"sort_by": "running_first", "limit": "10"})
@@ -380,16 +382,37 @@ class BitriseTest(unittest.TestCase):
             "held": ("◌", "warn"),
             "ok": ("✓", "ok"),
             "failed": ("✗", "bad"),
-            "aborted": ("⊘", "faint"),
-            "aborted-failure": ("⊘", "faint"),
+            "aborted": ("○", "faint"),
+            "aborted-failure": ("○", "faint"),
         })
 
-    def test_a_pr_build_shows_its_pr_number_in_place_of_the_branch(self):
-        self.bitrise.app("app1", "Rider iOS", [build("b-1", branch="feature/x", pr=4921)])
+    def test_a_pr_build_shows_its_pr_title_and_not_its_number(self):
+        self.bitrise.app("app1", "Rider iOS", [
+            build("b-1", branch="feature/x", pr=4921, message="Plan Ride with a Map View"),
+        ])
         plugin = self.start()
         self.open(plugin, token=TOKEN, apps="app1")
         [item] = self.items(self.refresh(plugin))
-        self.assertEqual(self.texts(item)[3], "#4921")
+        self.assertEqual(self.texts(item)[2], "Plan Ride with a Map View")
+        self.assertNotIn("4921", "".join(self.texts(item)))
+
+    def test_a_build_with_no_commit_message_is_titled_by_its_branch(self):
+        self.bitrise.app("app1", "Rider iOS", [
+            build("none", branch="master"),
+            build("blank", branch="release/1.2", message="  \n"),
+        ])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        titles = {i["id"]: self.texts(i)[2] for i in self.items(self.refresh(plugin))}
+        self.assertEqual(titles, {"none": "master", "blank": "release/1.2"})
+
+    def test_the_title_takes_the_spare_width_and_the_workflow_drops_first(self):
+        self.bitrise.app("app1", "Rider iOS", [build("b-1")])
+        plugin = self.start()
+        self.open(plugin, token=TOKEN, apps="app1")
+        columns = self.refresh(plugin)["payload"]["columns"]
+        self.assertTrue(columns[2].get("flex"))
+        self.assertEqual([c["priority"] for c in columns], [0, 2, 1, 4, 3])
 
     def test_a_running_build_shows_how_long_it_has_run(self):
         self.bitrise.app("app1", "Rider iOS", [
