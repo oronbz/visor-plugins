@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  VISOR_REF: spec-64-plugins
+  VISOR_REF: main
 
 jobs:
   test:
