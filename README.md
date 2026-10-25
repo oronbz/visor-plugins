@@ -5,6 +5,7 @@ The official Plugins for [visor](https://github.com/oronbz/visor), the terminal 
 | Plugin | Shows |
 |---|---|
 | [`bitrise`](bitrise/README.md) | The latest builds of the Bitrise apps you watch |
+| [`nowplaying`](nowplaying/README.md) | What your Mac or Linux desktop is playing, with play/pause, next, previous and seek |
 
 Plugins need `python3` (3.9 or later) on your `PATH`. Windows doesn't come with it, so install it from [python.org](https://www.python.org/downloads/) first.
 

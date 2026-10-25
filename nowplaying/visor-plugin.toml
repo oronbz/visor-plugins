@@ -1,0 +1,22 @@
+name = "nowplaying"
+description = "What your Mac or Linux desktop is playing, with play/pause, next, previous and seek"
+protocol = 1
+command = ["python3", "plugin.py"]
+
+[[widget]]
+type = "nowplaying"
+title = "Now Playing"
+description = "The track playing now: artwork, title, artist, album, progress and a visualizer, with play/pause, next, previous and seek keys."
+
+[[widget.setting]]
+name = "seek"
+kind = "duration"
+default = "10s"
+description = "How far [ and ] seek back and forward"
+
+[[widget.setting]]
+name = "visualizer"
+kind = "bool"
+default = true
+description = "Show the animated visualizer bars under the progress bar"
+why = "Turn it off to push one update a second while playing instead of four."
