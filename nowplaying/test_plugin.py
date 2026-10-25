@@ -314,6 +314,14 @@ class Shared:
         self.assertEqual(status["action"]["target"], self.install_target)
         self.assertIn(status["action"]["verb"], ("copy", "open"))
 
+    def test_a_missing_tool_is_reported_once_through_the_refresh(self):
+        os.remove(os.path.join(self.bin, self.tools[0]))
+        plugin = self.start()
+        self.open(plugin)
+        self.assertIsNone(plugin.update_within(0.5))
+        self.assertEqual(self.refresh(plugin)["status"]["state"], "setup")
+        self.assertIsNone(plugin.update_within(1))
+
     def test_each_action_runs_its_command_and_seeks_by_the_seek_setting(self):
         self.paused(at=100)
         plugin = self.start()

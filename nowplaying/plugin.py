@@ -527,6 +527,8 @@ class Widget:
         self.sending = threading.Lock()
         self.ticker = None
         self.levels = []
+        self.refreshed = False
+        self.status = None
 
     def resize(self, size):
         self.width = size.get("width", self.width)
@@ -630,9 +632,19 @@ class Widget:
         with self.sending:
             with state_lock:
                 update = None if self.closed.is_set() else make()
-            if update is not None:
+                fresh = update is not None and self.fresh(update)
+            if fresh:
                 send({"method": "widget/update", "params": dict(update, widget=self.id)})
             return update
+
+    def fresh(self, update):
+        """Whether visor should get update: not before its first refresh, which answers with
+        the same state, nor a status it already has. Notes the status visor then has."""
+        if not self.refreshed:
+            return False
+        status, last = update.get("status"), self.status
+        self.status = status
+        return status is None or status != last
 
 
 def bands(bars, rows):
@@ -664,7 +676,9 @@ def refresh(id):
     player.ready.wait(FIRST_RECORD)
     with state_lock:
         widget.start_ticker()
-        return widget.update()
+        update = widget.update()
+        widget.refreshed, widget.status = True, update.get("status")
+        return update
 
 
 def invoke(params):
