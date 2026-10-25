@@ -14,6 +14,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import namedtuple
@@ -95,34 +96,43 @@ def cache_dir():
 
 def save_artwork(data, ext):
     """The cached file holding data, written once and named by its hash, since visor
-    reads a path again only when its mtime or size changes."""
+    reads a path again only when its mtime or size changes. Every running visor has its
+    own Plugin process sharing this folder, so each writes its own partial files and
+    moves the finished one into place in one step."""
     folder = cache_dir()
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, hashlib.sha256(data).hexdigest()[:24] + ext)
     if not os.path.exists(path):
-        partial = path + ".partial"
-        with open(partial, "wb") as f:
+        source = partial_file(folder, ext)
+        with open(source, "wb") as f:
             f.write(data)
-        if not squared(partial, dimensions(data), path):
-            os.replace(partial, path)
+        done = squared(source, dimensions(data), partial_file(folder, ext)) or source
+        os.replace(done, path)
+        if done != source:
+            os.remove(source)
         prune(folder, path)
     return path
 
 
-def squared(source, size, path):
-    """Whether sips, which macOS ships, wrote source cropped to a centred square at path:
-    a web player's artwork is often a 16:9 crop of a square cover."""
+def partial_file(folder, ext):
+    fd, path = tempfile.mkstemp(dir=folder, suffix=ext + ".partial")
+    os.close(fd)
+    return path
+
+
+def squared(source, size, out):
+    """out, once sips, which macOS ships, wrote source there cropped to a centred square,
+    or None: a web player's artwork is often a 16:9 crop of a square cover."""
     sips = shutil.which("sips")
-    if not sips or not size or size[0] == size[1]:
-        return False
-    side = str(min(size))
-    done = subprocess.run([sips, "-c", side, side, source, "--out", path],
-                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL, timeout=TIMEOUT)
-    if done.returncode != 0 or not os.path.exists(path):
-        return False
-    os.remove(source)
-    return True
+    if sips and size and size[0] != size[1]:
+        side = str(min(size))
+        done = subprocess.run([sips, "-c", side, side, source, "--out", out],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=TIMEOUT)
+        if done.returncode == 0 and os.path.getsize(out):
+            return out
+    os.remove(out)
+    return None
 
 
 def dimensions(data):
@@ -160,12 +170,20 @@ def ratio(path):
 
 
 def prune(folder, keep):
-    files = [os.path.join(folder, name) for name in os.listdir(folder)
-             if not name.endswith(".partial")]
-    files.sort(key=os.path.getmtime, reverse=True)
-    for path in files[KEEP_ARTWORK:]:
+    files = []
+    for name in os.listdir(folder):
+        if not name.endswith(".partial"):
+            try:
+                files.append((os.path.getmtime(os.path.join(folder, name)), name))
+            except FileNotFoundError:
+                pass
+    for _, name in sorted(files, reverse=True)[KEEP_ARTWORK:]:
+        path = os.path.join(folder, name)
         if path != keep:
-            os.remove(path)
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
 
 
 def extension(mime):

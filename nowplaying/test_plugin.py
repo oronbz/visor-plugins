@@ -58,6 +58,7 @@ if TOOL == "media-control" and args == ["test"]:
 if TOOL == "media-control" and args[:1] == ["stream"]:
     tail(lambda record: json.dumps(record))
 if TOOL == "sips":
+    time.sleep(0.2)
     with open(args[3], "rb") as source, open(args[args.index("--out") + 1], "wb") as out:
         out.write(b"square " + source.read())
 if TOOL == "playerctl" and "--follow" in args:
@@ -596,8 +597,21 @@ class MediaControlTest(Shared, NowPlayingTest):
             self.assertEqual(f.read(), b"square " + png(160, 90))
         [call] = self.calls()
         self.assertEqual(call[:3], ["-c", "90", "90"])
-        self.assertEqual(call[4:], ["--out", path])
+        self.assertEqual(call[4], "--out")
         self.assertEqual(os.listdir(self.cache), [os.path.basename(path)])
+
+    def test_two_visors_cropping_the_same_artwork_both_show_it_square(self):
+        self.install("sips")
+        self.emit(track(artworkData=base64.b64encode(png(160, 90)).decode(),
+                        artworkMimeType="image/png"))
+        plugins = [self.start(), self.start()]
+        for plugin in plugins:
+            self.open(plugin)
+        paths = {self.refresh(plugin)["payload"]["image"]["path"] for plugin in plugins}
+        self.assertEqual(len(paths), 1)
+        with open(paths.pop(), "rb") as f:
+            self.assertEqual(f.read(), b"square " + png(160, 90))
+        self.assertEqual(len(os.listdir(self.cache)), 1)
 
     def test_square_artwork_is_kept_as_it_is(self):
         self.install("sips")
