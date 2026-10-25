@@ -3,12 +3,14 @@ import json
 import os
 import queue
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import zlib
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -55,6 +57,9 @@ if TOOL == "media-control" and args == ["test"]:
     sys.exit(int(open(path).read()) if os.path.exists(path) else 0)
 if TOOL == "media-control" and args[:1] == ["stream"]:
     tail(lambda record: json.dumps(record))
+if TOOL == "sips":
+    with open(args[3], "rb") as source, open(args[args.index("--out") + 1], "wb") as out:
+        out.write(b"square " + source.read())
 if TOOL == "playerctl" and "--follow" in args:
     template = args[args.index("--format") + 1]
     tail(lambda record: playerctl_line(record, template))
@@ -65,6 +70,13 @@ with open(os.path.join(DIR, "calls"), "a") as calls:
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
 JPEG = b"\xff\xd8\xff\xe0 not really a jpeg"
+
+
+def png(width, height):
+    """A PNG's signature and header, all the Plugin reads of an image."""
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + header
+            + struct.pack(">I", zlib.crc32(b"IHDR" + header)))
 
 
 def stamp(seconds_ago=0):
@@ -364,7 +376,7 @@ class Shared:
         pushed = plugin.updates_for(1.1)
         self.assertGreaterEqual(len(pushed), 3)
         self.assertLessEqual(len(pushed), 6)
-        frames = [tuple(self.charts(u["payload"])[0]["values"]) for u in pushed]
+        frames = [tuple(self.charts(u["payload"])[-1]["values"]) for u in pushed]
         self.assertGreater(len(set(frames)), 2)
         self.assertEqual(len(frames[0]), 120)
         self.assertGreater(self.progress(pushed[-1]["payload"])[2]["bar"]["value"],
@@ -417,14 +429,32 @@ class Shared:
         for update in pushed:
             self.assertEqual(self.charts(update["payload"]), [])
 
+    def test_the_visualizer_fills_the_rows_left_in_three_colours(self):
+        self.paused()
+        plugin = self.start()
+        self.open(plugin, height=10)
+        payload = self.showing(plugin, lambda p: self.texts(p)[0] == "Teardrop")
+        self.assertEqual([(c["token"], c["rows"]) for c in self.charts(payload)],
+                         [("info", 2), ("accent", 2), ("alt", 2)])
+
+    def test_a_short_tile_has_fewer_colours_and_one_with_no_room_none(self):
+        self.paused()
+        plugin = self.start()
+        for height, bands in ((6, [("accent", 1), ("alt", 1)]), (4, [])):
+            with self.subTest(height=height):
+                self.open(plugin, height=height)
+                payload = self.showing(plugin, lambda p: self.texts(p)[0] == "Teardrop")
+                self.assertEqual([(c["token"], c["rows"]) for c in self.charts(payload)], bands)
+
     def test_paused_the_visualizer_is_one_flat_still_row_of_dots(self):
         self.paused()
         plugin = self.start()
         self.open(plugin, height=8)
         payload = self.showing(plugin, lambda p: self.texts(p)[0] == "Teardrop")
-        [chart] = self.charts(payload)
-        self.assertNotIn("rows", chart)
-        self.assertEqual(set(chart["values"]), {1 / 16})
+        *above, bottom = self.charts(payload)
+        self.assertEqual(set(bottom["values"]), {1 / 8})
+        for chart in above:
+            self.assertEqual(set(chart["values"]), {0})
 
     def test_a_track_with_only_a_title_still_shows_its_progress(self):
         self.paused(artist="", album="")
@@ -546,6 +576,42 @@ class MediaControlTest(Shared, NowPlayingTest):
         self.assertEqual(payload["image"], image)
         self.assertEqual(os.stat(image["path"]).st_mtime_ns, first)
         self.assertEqual(len(os.listdir(self.cache)), 2)
+
+    def test_wide_artwork_is_cropped_to_a_centred_square(self):
+        self.install("sips")
+        self.emit(track(artworkData=base64.b64encode(png(160, 90)).decode(),
+                        artworkMimeType="image/png"))
+        plugin = self.start()
+        self.open(plugin)
+        path = self.refresh(plugin)["payload"]["image"]["path"]
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"square " + png(160, 90))
+        [call] = self.calls()
+        self.assertEqual(call[:3], ["-c", "90", "90"])
+        self.assertEqual(call[4:], ["--out", path])
+        self.assertEqual(os.listdir(self.cache), [os.path.basename(path)])
+
+    def test_square_artwork_is_kept_as_it_is(self):
+        self.install("sips")
+        self.emit(track(artworkData=base64.b64encode(png(90, 90)).decode(),
+                        artworkMimeType="image/png"))
+        plugin = self.start()
+        self.open(plugin)
+        with open(self.refresh(plugin)["payload"]["image"]["path"], "rb") as f:
+            self.assertEqual(f.read(), png(90, 90))
+        self.assertEqual(self.calls(), [])
+
+    def test_artwork_goes_on_top_when_the_text_beside_it_would_be_too_narrow(self):
+        self.emit(track(artworkData=base64.b64encode(png(90, 90)).decode(),
+                        artworkMimeType="image/png"))
+        plugin = self.start()
+        for width, height, side, rows in ((60, 8, "left", 4), (60, 20, "top", 5),
+                                          (40, 10, "top", 2)):
+            with self.subTest(width=width, height=height):
+                self.open(plugin, width=width, height=height)
+                payload = self.refresh(plugin)["payload"]
+                self.assertEqual(payload["image"]["side"], side)
+                self.assertEqual(sum(c["rows"] for c in self.charts(payload)), rows)
 
     def test_the_animation_frames_do_not_resend_the_artwork(self):
         self.playing(artworkData=base64.b64encode(PNG).decode(), artworkMimeType="image/png")

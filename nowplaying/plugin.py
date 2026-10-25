@@ -11,6 +11,7 @@ import os
 import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -30,6 +31,9 @@ TIMEOUT = 10
 KEEP_ARTWORK = 20
 DRIFT = 1.5
 MAX_ARTWORK = 10 * 1024 * 1024
+CELL = 2.1
+BESIDE = 24
+BANDS = ("alt", "accent", "info")
 
 MEDIA_CONTROL_INSTALL = "brew tap ungive/media-control && brew install media-control"
 PLAYERCTL_INSTALL = "https://github.com/altdesktop/playerctl#installing"
@@ -40,6 +44,7 @@ Session.__doc__ = ("A media session as the Widget shows it: elapsed seconds as o
 
 widgets = {}
 player = None
+ratios = {}
 state_lock = threading.Lock()
 write_lock = threading.Lock()
 
@@ -98,9 +103,60 @@ def save_artwork(data, ext):
         partial = path + ".partial"
         with open(partial, "wb") as f:
             f.write(data)
-        os.replace(partial, path)
+        if not squared(partial, dimensions(data), path):
+            os.replace(partial, path)
         prune(folder, path)
     return path
+
+
+def squared(source, size, path):
+    """Whether sips, which macOS ships, wrote source cropped to a centred square at path:
+    a web player's artwork is often a 16:9 crop of a square cover."""
+    sips = shutil.which("sips")
+    if not sips or not size or size[0] == size[1]:
+        return False
+    side = str(min(size))
+    done = subprocess.run([sips, "-c", side, side, source, "--out", path],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, timeout=TIMEOUT)
+    if done.returncode != 0 or not os.path.exists(path):
+        return False
+    os.remove(source)
+    return True
+
+
+def dimensions(data):
+    """A PNG's or JPEG's (width, height) from its header, or None."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        return struct.unpack(">II", data[16:24])
+    if data[:2] != b"\xff\xd8":
+        return None
+    at = 2
+    while at + 9 <= len(data):
+        if data[at] != 0xFF:
+            at += 1
+            continue
+        marker = data[at + 1]
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            height, width = struct.unpack(">HH", data[at + 5:at + 9])
+            return width, height
+        if marker == 0xFF or marker == 0x01 or 0xD0 <= marker <= 0xD8:
+            at += 1 if marker == 0xFF else 2
+            continue
+        at += 2 + struct.unpack(">H", data[at + 2:at + 4])[0]
+    return None
+
+
+def ratio(path):
+    """The artwork at path's width over its height, 1 when it can't be read."""
+    if path not in ratios:
+        try:
+            with open(path, "rb") as f:
+                size = dimensions(f.read(65536))
+        except OSError:
+            size = None
+        ratios[path] = size[0] / size[1] if size and size[1] else 1.0
+    return ratios[path]
 
 
 def prune(folder, keep):
@@ -492,11 +548,17 @@ class Widget:
                 lines.append({"spans": [{"text": text, "token": token}]})
         lines.append({"spans": self.progress(session, now)})
         if self.visualizer:
-            lines.append({"chart": {"values": self.bars(session), "token": "accent"}})
+            lines += bands(self.bars(session), self.rows(session))
         out = {"lines": lines, "actions": actions(self.seek)}
         if session.artwork:
-            out["image"] = {"path": session.artwork, "side": "left"}
+            out["image"] = {"path": session.artwork, "side": self.side(session)}
         return out
+
+    def side(self, session):
+        """left while the text beside the artwork keeps BESIDE cells, else top: visor drops
+        a side image that leaves under 20, and a square one is about CELL cells wide a row."""
+        beside = self.width - round(self.height * CELL * ratio(session.artwork)) - 1
+        return "left" if beside >= BESIDE else "top"
 
     def progress(self, session, now):
         at = position(session, now)
@@ -509,19 +571,26 @@ class Widget:
         return spans
 
     def rows(self, session):
-        return self.height - text_lines(session)
+        """The visualizer's rows: what the text leaves, or a third of it under top artwork."""
+        spare = self.height - text_lines(session)
+        if session.artwork and self.side(session) == "top":
+            return spare // 3
+        return spare
 
     def bars(self, session):
-        """Pseudo-random levels that jump up and fall back while playing, and a flat
-        line one dot high, given the rows the text leaves, while paused."""
+        """Each bar's height in braille dots: pseudo-random hills that jump up and fall
+        back slowly while playing, and one flat dot while paused."""
         count = max(2, 2 * self.width)
+        dots = 4 * max(1, self.rows(session))
         if not session.playing:
             self.levels = []
-            return [1 / (4 * max(1, self.rows(session)))] * count
+            return [1] * count
         old = self.levels[-count:] if len(self.levels) >= count else [0.0] * count
-        self.levels = [max(random.random() ** 1.6 * (1 - 0.4 * i / count), level * 0.6)
-                       for i, level in enumerate(old)]
-        return self.levels
+        drawn = [random.random() ** 1.6 * (1 - 0.4 * i / count) for i in range(count)]
+        hills = [(drawn[max(0, i - 1)] + 2 * d + drawn[min(count - 1, i + 1)]) / 4
+                 for i, d in enumerate(drawn)]
+        self.levels = [max(h, level * 0.75) for h, level in zip(hills, old)]
+        return [round(level * dots) for level in self.levels]
 
     def interval(self):
         session = player.session
@@ -564,6 +633,22 @@ class Widget:
             if update is not None:
                 send({"method": "widget/update", "params": dict(update, widget=self.id)})
             return update
+
+
+def bands(bars, rows):
+    """The visualizer as up to three charts stacked top to bottom, one colour each, so a
+    bar runs up through them: each chart draws the dots of every bar within its rows."""
+    if rows <= 0:
+        return []
+    count = min(len(BANDS), rows)
+    sizes = [rows // count] * count
+    sizes[0] += rows - sum(sizes)
+    out, below = [], 0
+    for token, size in zip(BANDS, sizes):
+        values = [min(max(dots - 4 * below, 0), 4 * size) / (4 * size) for dots in bars]
+        out.insert(0, {"chart": {"values": values, "rows": size, "token": token}})
+        below += size
+    return out
 
 
 def widget_of(id):

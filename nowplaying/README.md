@@ -5,9 +5,13 @@ A [visor](https://github.com/oronbz/visor) Widget with what your Mac or Linux de
 - the title, in bold
 - the artist, dimmed, and the album, fainter (each left out when the player has none)
 - ▶ while playing or ⏸ while paused, the elapsed time, a progress bar and the track's length
-- a visualizer filling the rows left: bars that jump while playing and lie flat and still while paused
+- a visualizer filling the rows left, in three colours from bottom to top: bars that jump while playing and lie flat and still while paused
 
-The bars are made up, not drawn from the audio. In a short tile the visualizer goes first. With nothing playing at all, the Widget says "Nothing playing"; a paused track stays on screen with ⏸. The title is always "Now Playing", whatever app plays.
+The bars are made up, not drawn from the audio. In a short tile the visualizer goes first. When the tile is too tall or narrow for text beside the artwork, the artwork moves above the text and shares the spare rows with the visualizer.
+
+Artwork that isn't square, such as the 16:9 thumbnail a web player like YouTube Music hands macOS, is cropped to a centred square with `sips`, which macOS ships. On Linux it's shown as it is.
+
+With nothing playing at all, the Widget says "Nothing playing"; a paused track stays on screen with ⏸. The title is always "Now Playing", whatever app plays.
 
 ## Install
 
