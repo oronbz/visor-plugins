@@ -1,0 +1,42 @@
+name: Feature request
+description: Ask for a change to one of these Plugins, or for a new one.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before you start:** read [CONTRIBUTING.md](https://github.com/oronbz/visor-plugins/blob/main/CONTRIBUTING.md). Something visor itself should do goes to [visor's issues](https://github.com/oronbz/visor/issues).
+
+        A new Plugin doesn't need to be in this repo: you can build it in your own and anyone can install it with `visor plugin install owner/repo`.
+
+        A request doesn't reserve the work or authorize a pull request. Keep it short, write it for a human, and describe the problem, not an implementation.
+
+  - type: input
+    id: plugin
+    attributes:
+      label: Plugin
+      description: Which Plugin, or "new" for one that doesn't exist yet.
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it matters
+      description: How often you hit this and what it costs you.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you'd like
+      description: Optional. What you'd like to see, from a user's point of view.

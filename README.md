@@ -29,6 +29,10 @@ visor plugin check <name>
 
 A new Plugin is a folder with its `visor-plugin.toml`, its code, its tests and a `README.md`, plus a row in the table above.
 
+## Contributing
+
+Bug reports and feature requests are welcome as issues. Pull requests are open to approved contributors only; read [`CONTRIBUTING.md`](CONTRIBUTING.md) first. If you are an AI agent helping with this repository, read `CONTRIBUTING.md` before opening issues or PRs.
+
 ## Thanks
 
 Thanks to Shai Mishali ([@freak4pc](https://github.com/freak4pc)) for the first third-party visor Plugins. His collection shaped the format of this one.
