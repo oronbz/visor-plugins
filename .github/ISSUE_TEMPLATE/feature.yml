@@ -1,6 +1,6 @@
 name: Feature request
 description: Ask for a change to one of these Plugins, or for a new one.
-labels: [enhancement]
+labels: [enhancement, needs-triage]
 body:
   - type: markdown
     attributes:
