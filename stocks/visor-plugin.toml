@@ -1,0 +1,39 @@
+name = "stocks"
+description = "Stock, index, fund and crypto quotes from Yahoo Finance, with a chart of one of them"
+protocol = 1
+command = ["python3", "plugin.py"]
+
+[[widget]]
+type = "stocks"
+title = "Stocks"
+description = "The symbols you watch with their price and day change, under a chart of one of them."
+refresh = "1m"
+floor = "15s"
+
+[[widget.setting]]
+name = "symbols"
+kind = "string"
+default = "^GSPC, ^IXIC, AAPL, MSFT, NVDA"
+description = "The symbols to watch, as Yahoo Finance writes them, comma-separated"
+why = "^ marks an index, a suffix an exchange (TEVA.TA is Tel Aviv), and BTC-USD is a crypto pair."
+required = true
+
+[[widget.setting]]
+name = "headline"
+kind = "string"
+default = ""
+description = "The symbol charted above the list; empty charts the first one"
+
+[[widget.setting]]
+name = "range"
+kind = "string"
+default = "1d"
+description = "How far back the chart goes"
+why = "Past 1d, the headline's change is over the whole range; the list keeps the day's."
+choices = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "ytd", "max"]
+
+[[widget.setting]]
+name = "chart"
+kind = "int"
+default = 3
+description = "Rows of the headline chart; 0 leaves the headline out"
